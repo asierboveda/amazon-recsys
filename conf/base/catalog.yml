@@ -39,14 +39,14 @@
 # (transcoding), templating and a way to reuse arguments that are frequently repeated. See more here:
 # https://docs.kedro.org/en/stable/data/data_catalog.html
 
-# 1. Raw data 
+# 1. Raw data
 amazon_reviews:
-  type: spark.SparkDataSet
+  type: spark.SparkDataset
   filepath: data/01_raw/video_games.parquet
   file_format: parquet
 
 # 2. Intermediate data
 preprocessed_video_games:
-  type: spark.SparkDataSet
+  type: spark.SparkDataset
   filepath: data/02_intermediate/preprocessed_video_games.parquet
   file_format: parquet
