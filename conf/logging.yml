@@ -36,7 +36,7 @@ loggers:
   kedro:
     level: INFO
 
-  pyspark_spaceflights:
+  amazon_recsys:
     level: INFO
 
 root:
