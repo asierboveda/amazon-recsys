@@ -2,6 +2,19 @@
 from the Kedro defaults. For further information, including these default values, see
 https://docs.kedro.org/en/stable/kedro_project_setup/settings.html."""
 
+import os
+import sys
+from pathlib import Path
+
+# Fix for Spark on Windows: point HADOOP_HOME to the bundled winutils.exe
+if sys.platform == "win32":
+    _project_root = Path(__file__).resolve().parents[2]
+    _hadoop_home = _project_root / "hadoop"
+    if _hadoop_home.exists():
+        os.environ.setdefault("HADOOP_HOME", str(_hadoop_home))
+        os.environ["PYSPARK_PYTHON"] = sys.executable
+        os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
 # Instantiated project hooks.
 
 # Hooks are executed in a Last-In-First-Out (LIFO) order.
