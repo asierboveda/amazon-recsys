@@ -1,0 +1,25 @@
+# Parameters for the recommender_als pipeline
+recommender_als:
+  als:
+    user_col: user_idx
+    item_col: item_idx
+    rating_col: rating
+    rank: 50
+    maxIter: 10
+    regParam: 0.1
+    nonnegative: true
+    implicitPrefs: false
+    coldStartStrategy: drop
+    seed: 42
+
+  recommendations:
+    k: 20
+
+  evaluation:
+    k_values: [10, 20]
+
+  popularity_baseline:
+    score_by: interaction_count
+
+  # Path used internally by Spark to save the trained model
+  model_path: data/06_models/als_model_spark

@@ -1,52 +1,93 @@
-# Here you can define all your data sets by using simple YAML syntax.
-#
-# Documentation for this file format can be found in "The Data Catalog"
-# Link: https://docs.kedro.org/en/stable/data/data_catalog.html
-#
-# We support interacting with a variety of data stores including local file systems, cloud, network and HDFS
-#
-# An example data set definition can look as follows:
-#
-#bikes:
-#  type: pandas.CSVDataset
-#  filepath: "data/01_raw/bikes.csv"
-#
-#weather:
-#  type: spark.SparkDataset
-#  filepath: s3a://your_bucket/data/01_raw/weather*
-#  file_format: csv
-#  credentials: dev_s3
-#  load_args:
-#    header: True
-#    inferSchema: True
-#  save_args:
-#    sep: '|'
-#    header: True
-#
-#scooters:
-#  type: pandas.SQLTableDataset
-#  credentials: scooters_credentials
-#  table_name: scooters
-#  load_args:
-#    index_col: ['name']
-#    columns: ['name', 'gear']
-#  save_args:
-#    if_exists: 'replace'
-#    # if_exists: 'fail'
-#    # if_exists: 'append'
-#
-# The Data Catalog supports being able to reference the same file using two different Dataset implementations
-# (transcoding), templating and a way to reuse arguments that are frequently repeated. See more here:
-# https://docs.kedro.org/en/stable/data/data_catalog.html
-
 # 1. Raw data
-amazon_reviews:
+raw_video_games_reviews:
   type: spark.SparkDataset
   filepath: data/01_raw/video_games.parquet
   file_format: parquet
 
-# 2. Intermediate data
-preprocessed_video_games:
+# ============================================================
+# 2. data_processing outputs
+# ============================================================
+
+recsys_interactions_selected:
   type: spark.SparkDataset
-  filepath: data/02_intermediate/preprocessed_video_games.parquet
+  filepath: data/02_intermediate/recsys_interactions_selected.parquet
   file_format: parquet
+
+recsys_interactions_clean:
+  type: spark.SparkDataset
+  filepath: data/02_intermediate/recsys_interactions_clean.parquet
+  file_format: parquet
+
+recsys_interactions_deduplicated:
+  type: spark.SparkDataset
+  filepath: data/03_primary/recsys_interactions_deduplicated.parquet
+  file_format: parquet
+
+recsys_interactions_filtered:
+  type: spark.SparkDataset
+  filepath: data/03_primary/recsys_interactions_filtered.parquet
+  file_format: parquet
+
+recsys_interactions_indexed:
+  type: spark.SparkDataset
+  filepath: data/04_feature/recsys_interactions_indexed.parquet
+  file_format: parquet
+
+user_id_mapping:
+  type: spark.SparkDataset
+  filepath: data/04_feature/user_id_mapping.parquet
+  file_format: parquet
+
+item_id_mapping:
+  type: spark.SparkDataset
+  filepath: data/04_feature/item_id_mapping.parquet
+  file_format: parquet
+
+als_train:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/als_train.parquet
+  file_format: parquet
+
+als_validation:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/als_validation.parquet
+  file_format: parquet
+
+als_test:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/als_test.parquet
+  file_format: parquet
+
+# ============================================================
+# 3. recommender_als outputs
+# ============================================================
+
+als_explicit_model:
+  type: pickle.PickleDataset
+  filepath: data/06_models/als_explicit_model.pkl
+
+als_recommendations_top_k:
+  type: spark.SparkDataset
+  filepath: data/07_model_output/als_recommendations_top_k.parquet
+  file_format: parquet
+
+popularity_recommendations_top_k:
+  type: spark.SparkDataset
+  filepath: data/07_model_output/popularity_recommendations_top_k.parquet
+  file_format: parquet
+
+als_regression_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/als_regression_metrics.json
+
+als_ranking_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/als_ranking_metrics.json
+
+popularity_ranking_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/popularity_ranking_metrics.json
+
+als_metrics_comparison:
+  type: json.JSONDataset
+  filepath: data/08_reporting/als_metrics_comparison.json
