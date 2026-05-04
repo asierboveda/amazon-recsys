@@ -3,6 +3,8 @@ raw_video_games_reviews:
   type: spark.SparkDataset
   filepath: data/01_raw/video_games.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 # ============================================================
 # 2. data_processing outputs
@@ -12,51 +14,71 @@ recsys_interactions_selected:
   type: spark.SparkDataset
   filepath: data/02_intermediate/recsys_interactions_selected.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 recsys_interactions_clean:
   type: spark.SparkDataset
   filepath: data/02_intermediate/recsys_interactions_clean.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 recsys_interactions_deduplicated:
   type: spark.SparkDataset
   filepath: data/03_primary/recsys_interactions_deduplicated.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 recsys_interactions_filtered:
   type: spark.SparkDataset
   filepath: data/03_primary/recsys_interactions_filtered.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 recsys_interactions_indexed:
   type: spark.SparkDataset
   filepath: data/04_feature/recsys_interactions_indexed.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 user_id_mapping:
   type: spark.SparkDataset
   filepath: data/04_feature/user_id_mapping.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 item_id_mapping:
   type: spark.SparkDataset
   filepath: data/04_feature/item_id_mapping.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 als_train:
   type: spark.SparkDataset
   filepath: data/05_model_input/als_train.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 als_validation:
   type: spark.SparkDataset
   filepath: data/05_model_input/als_validation.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 als_test:
   type: spark.SparkDataset
   filepath: data/05_model_input/als_test.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 # ============================================================
 # 3. recommender_als outputs
@@ -70,11 +92,15 @@ als_recommendations_top_k:
   type: spark.SparkDataset
   filepath: data/07_model_output/als_recommendations_top_k.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 popularity_recommendations_top_k:
   type: spark.SparkDataset
   filepath: data/07_model_output/popularity_recommendations_top_k.parquet
   file_format: parquet
+  save_args:
+    mode: overwrite
 
 als_regression_metrics:
   type: json.JSONDataset
