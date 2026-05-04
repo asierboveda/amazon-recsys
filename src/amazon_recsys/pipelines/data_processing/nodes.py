@@ -115,6 +115,11 @@ def index_user_item_ids(
     Uses Spark's StringIndexer so that indices are assigned by descending
     frequency (most frequent → 0).
 
+    Mappings are extracted directly from the transformed DataFrame instead of
+    spark.createDataFrame with a Python list, which forces Spark to serialise
+    data through Python workers and fails on Windows when the ``python``
+    executable is not on PATH (e.g. the Microsoft Store stub).
+
     Args:
         df: Filtered interactions (must have user_id, item_id columns).
 
@@ -124,8 +129,6 @@ def index_user_item_ids(
         - user_mapping: DataFrame with columns [user_id, user_idx].
         - item_mapping: DataFrame with columns [item_id, item_idx].
     """
-    spark = SparkSession.builder.getOrCreate()
-
     user_indexer = StringIndexer(
         inputCol="user_id", outputCol="user_idx", handleInvalid="skip"
     )
@@ -141,20 +144,11 @@ def index_user_item_ids(
     df = df.withColumn("user_idx", F.col("user_idx").cast("int"))
     df = df.withColumn("item_idx", F.col("item_idx").cast("int"))
 
+    user_mapping = df.select("user_id", "user_idx").distinct()
+    item_mapping = df.select("item_id", "item_idx").distinct()
+
     df = df.select(
         "user_idx", "item_idx", "rating", "timestamp", "user_id", "item_id"
-    )
-
-    user_labels = user_model.labels
-    user_mapping = spark.createDataFrame(
-        [(label, i) for i, label in enumerate(user_labels)],
-        schema=["user_id", "user_idx"],
-    )
-
-    item_labels = item_model.labels
-    item_mapping = spark.createDataFrame(
-        [(label, i) for i, label in enumerate(item_labels)],
-        schema=["item_id", "item_idx"],
     )
 
     return df, user_mapping, item_mapping
