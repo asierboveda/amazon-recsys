@@ -1,0 +1,565 @@
+SASREC PARA AMAZON_RECSYS
+=========================
+
+Objetivo del documento
+----------------------
+
+Este documento explica SASRec desde tres angulos:
+
+1. Que problema resuelve y por que complementa a ALS y LightGCN.
+2. Cual es su estructura teorica: secuencias, self-attention, masking, loss e
+   inferencia.
+3. Como implementarlo de forma limpia dentro del proyecto Kedro/Spark actual.
+
+Fuentes principales usadas:
+
+- Paper: "Self-Attentive Sequential Recommendation", Wang-Cheng Kang y Julian
+  McAuley. ICDM 2018. arXiv: https://arxiv.org/abs/1808.09781
+- DOI IEEE: https://doi.org/10.1109/ICDM.2018.00035
+- Codigo oficial TensorFlow: https://github.com/kang205/SASRec
+- Documentacion RecBole: https://recbole.io/docs/v1.1.1/user_guide/model/sequential/sasrec.html
+
+
+1. Idea central
+---------------
+
+ALS y LightGCN son modelos collaborative filtering generales. Aprenden afinidad
+usuario-item, pero no modelan directamente el orden de las acciones de un
+usuario. SASRec se centra en recomendacion secuencial: dado el historial
+ordenado de un usuario, predice el siguiente item probable.
+
+Esto encaja especialmente bien con el proyecto porque el preprocesado actual
+conserva timestamp y ya hace split temporal:
+
+- La interaccion mas reciente va a test.
+- La segunda mas reciente puede ir a validation.
+- Las anteriores van a train.
+
+SASRec usa una arquitectura basada en self-attention para aprender que eventos
+pasados del usuario importan mas para predecir el siguiente evento. No trata el
+historial como una bolsa de items; lo trata como una secuencia.
+
+
+2. Diferencia conceptual frente a ALS y LightGCN
+------------------------------------------------
+
+ALS:
+
+- Entrada: pares usuario-item-rating.
+- Objetivo: reconstruir ratings o afinidades.
+- No usa orden temporal dentro del historial.
+
+LightGCN:
+
+- Entrada: grafo usuario-item de interacciones positivas.
+- Objetivo: ranking collaborative filtering.
+- Usa vecinos multi-hop, pero no modela posicion temporal.
+
+SASRec:
+
+- Entrada: secuencia ordenada de items por usuario.
+- Objetivo: predecir siguiente item.
+- Usa atencion causal para que cada posicion solo vea el pasado.
+
+Por eso SASRec no sustituye exactamente a LightGCN; mide otra hipotesis:
+
+"Las compras/reviews recientes y su orden explican bien la siguiente
+interaccion".
+
+
+3. Datos de entrada
+-------------------
+
+SASRec necesita secuencias por usuario:
+
+user_idx -> [item_1, item_2, item_3, ..., item_t]
+
+ordenadas por timestamp ascendente, de mas antiguo a mas reciente.
+
+En este proyecto:
+
+- user_idx e item_idx ya existen.
+- timestamp ya existe.
+- El split temporal actual es apropiado.
+
+Decision recomendada:
+
+- Construir secuencias desde recsys_interactions_indexed o desde los splits ya
+  creados, siempre respetando el corte temporal.
+- Para train: usar solo interacciones anteriores a validation/test.
+- Para validation: predecir el item de validation dado el historial de train.
+- Para test: predecir el item de test dado train + validation, o solo train si
+  se quiere una comparacion mas estricta. Hay que dejar esta decision fija y
+  documentada.
+
+Recomendacion para comparabilidad:
+
+- Validacion: historial = train, target = validation.
+- Test final: historial = train + validation, target = test.
+
+Esto reproduce una evaluacion next-item realista: cuando llega el momento de
+test, el sistema ya podria haber observado la interaccion de validation.
+
+
+4. Preparacion de secuencias
+----------------------------
+
+Cada usuario debe generar ejemplos de entrenamiento.
+
+Ejemplo de historial:
+
+Usuario u:
+
+t1 item A
+t2 item B
+t3 item C
+t4 item D
+t5 item E
+
+Con max_seq_len = 4, se pueden crear pares:
+
+input:  [A]          target: B
+input:  [A, B]       target: C
+input:  [A, B, C]    target: D
+input:  [A, B, C, D] target: E
+
+En entrenamiento por batches se usa padding a longitud fija:
+
+input_seq = [0, 0, A, B, C]
+pos_seq   = [0, 0, B, C, D]
+neg_seq   = [0, 0, X, Y, Z]
+
+El item 0 se reserva para padding. Por eso, si item_idx empieza en 0, conviene
+desplazar ids internos a item_idx + 1 dentro del dataset de SASRec. Al generar
+recomendaciones se vuelve a item_idx original restando 1.
+
+
+5. Estructura del modelo
+------------------------
+
+5.1 Item embeddings
+
+Cada item tiene un embedding entrenable:
+
+E_item in R^(num_items + 1 x hidden_size)
+
+El +1 es por el token padding 0.
+
+5.2 Positional embeddings
+
+Como self-attention no conoce el orden por si sola, se suma un embedding de
+posicion:
+
+X_t = item_embedding(item_t) + position_embedding(t)
+
+La posicion permite distinguir "este item aparecio hace mucho" de "este item
+aparecio justo antes del objetivo".
+
+5.3 Mascara de padding
+
+Las posiciones padding no deben influir en la representacion. Se aplica mascara
+para que los ceros no aporten senal.
+
+5.4 Self-attention causal
+
+SASRec usa atencion multi-cabeza. Para cada posicion, el modelo calcula que
+posiciones anteriores son relevantes.
+
+La mascara causal impide mirar al futuro:
+
+- La posicion t puede atender a posiciones <= t.
+- La posicion t no puede atender a posiciones > t.
+
+Esto evita fuga de informacion en entrenamiento. Sin mascara causal, el modelo
+podria usar items futuros para predecir el item actual.
+
+5.5 Bloques Transformer
+
+Cada bloque contiene:
+
+- Layer normalization.
+- Multi-head self-attention causal.
+- Conexion residual.
+- Feed-forward point-wise.
+- Dropout.
+- Otra conexion residual.
+
+La implementacion oficial usa bloques de self-attention y feed-forward sobre la
+secuencia. RecBole expone hiperparametros como hidden_size, inner_size,
+n_layers, n_heads, dropout y loss_type.
+
+5.6 Representacion final
+
+Para predecir el siguiente item se usa normalmente la representacion de la ultima
+posicion valida del historial. Esa representacion se compara contra embeddings de
+items candidatos mediante producto escalar.
+
+score(u, i) = dot(h_ultima_posicion, embedding_item_i)
+
+
+6. Funcion de perdida
+---------------------
+
+Hay dos variantes comunes.
+
+6.1 BCE con negative sampling
+
+La implementacion oficial usa items positivos y negativos por posicion:
+
+- pos: el siguiente item real.
+- neg: un item no observado.
+
+El objetivo sube score positivo y baja score negativo.
+
+Ventaja:
+
+- Mas ligero para muchos items.
+
+Riesgo:
+
+- La calidad depende del negative sampling.
+
+6.2 Cross-entropy full softmax
+
+RecBole permite tratar la prediccion como clasificacion sobre todos los items
+cuando loss_type = CE.
+
+Ventaja:
+
+- Objetivo directo de next-item classification.
+
+Riesgo:
+
+- Puede ser caro si hay muchos items.
+
+Recomendacion inicial para este proyecto:
+
+- Empezar con BCE/BPR-like negative sampling si el numero de items es grande.
+- Usar CE solo si el catalogo de items filtrado es manejable.
+
+
+7. Hiperparametros importantes
+------------------------------
+
+Configuracion inicial razonable:
+
+- max_seq_len: 50
+- hidden_size: 64
+- n_layers: 2
+- n_heads: 2
+- inner_size: 256
+- dropout: 0.2 a 0.5
+- learning_rate: 0.001
+- batch_size: 256
+- epochs: 50
+- loss_type: sampled_bce o CE segun implementacion
+- seed: 42
+
+Que tocar primero:
+
+- Si hay usuarios con historiales cortos: bajar max_seq_len o min_user_interactions.
+- Si overfitting: subir dropout o bajar hidden_size.
+- Si tarda mucho: bajar max_seq_len, batch_size o n_layers.
+- Si Recall@K es bajo: revisar split, negative sampling y exclusion de vistos.
+
+
+8. Estructura de implementacion recomendada
+-------------------------------------------
+
+Spark ML no trae SASRec. Hay dos caminos:
+
+Opcion A: RecBole como motor experimental.
+
+- Ventaja: implementacion probada de SASRec.
+- Ventaja: rapido para benchmark inicial.
+- Riesgo: hay que adaptar formato de datos y encajar outputs en Kedro.
+
+Opcion B: PyTorch propio dentro del repo.
+
+- Ventaja: control total sobre datos, metricas y catalogo Kedro.
+- Ventaja: facil devolver exactamente user_idx, item_idx, score, rank.
+- Riesgo: mas codigo que mantener.
+
+Recomendacion:
+
+- Si el objetivo es tener resultado rapido y academico: usar RecBole primero.
+- Si el objetivo es integrarlo como pipeline estable del proyecto: PyTorch propio.
+
+Para mantener el proyecto limpio, documentaria SASRec como pipeline propio y
+podria usarse RecBole como referencia de validacion.
+
+
+9. Nuevos archivos sugeridos
+----------------------------
+
+src/amazon_recsys/pipelines/recommender_sasrec/__init__.py
+src/amazon_recsys/pipelines/recommender_sasrec/dataset.py
+src/amazon_recsys/pipelines/recommender_sasrec/model.py
+src/amazon_recsys/pipelines/recommender_sasrec/nodes.py
+src/amazon_recsys/pipelines/recommender_sasrec/pipeline.py
+tests/pipelines/recommender_sasrec/test_pipeline.py
+
+Cambios de configuracion:
+
+conf/base/parameters.yml
+conf/base/catalog.yml
+src/amazon_recsys/pipeline_registry.py
+pyproject.toml o requirements.txt
+
+
+10. Nodos Kedro propuestos
+--------------------------
+
+10.1 build_sasrec_sequences
+
+Inputs:
+
+- recsys_interactions_indexed o als_train/als_validation/als_test
+- params:recommender_sasrec.data
+
+Outputs:
+
+- sasrec_train_sequences
+- sasrec_validation_sequences
+- sasrec_test_sequences
+- sasrec_dataset_stats
+
+Responsabilidad:
+
+- Ordenar por user_idx y timestamp.
+- Crear secuencias por usuario.
+- Aplicar max_seq_len.
+- Desplazar item_idx a item_idx + 1 para reservar 0 como padding.
+- Crear targets de validation y test.
+
+10.2 train_sasrec_model
+
+Inputs:
+
+- sasrec_train_sequences
+- sasrec_validation_sequences
+- params:recommender_sasrec.model
+
+Output:
+
+- sasrec_model
+
+Responsabilidad:
+
+- Crear Dataset/DataLoader.
+- Inicializar modelo.
+- Entrenar con negative sampling o CE.
+- Evaluar validation Recall@K.
+- Guardar mejor checkpoint en data/06_models/sasrec_model.pt.
+- Devolver metadata ligera.
+
+10.3 generate_sasrec_recommendations
+
+Inputs:
+
+- sasrec_model
+- sasrec_test_sequences
+- sasrec_seen_items
+- params:recommender_sasrec.recommendations
+
+Output:
+
+- sasrec_recommendations_top_k
+
+Responsabilidad:
+
+- Para cada usuario de test, tomar su historial.
+- Calcular h_ultima_posicion.
+- Scoring contra items candidatos.
+- Excluir items vistos.
+- Devolver user_idx, item_idx, score, rank.
+
+10.4 evaluate_sasrec_ranking_metrics
+
+Inputs:
+
+- sasrec_recommendations_top_k
+- als_test o sasrec_test_ground_truth
+- params:recommender_sasrec.evaluation
+
+Output:
+
+- sasrec_ranking_metrics
+
+Responsabilidad:
+
+- Calcular Recall@K igual que ALS y LightGCN.
+- Opcional: NDCG@K y HitRate@K, que son muy comunes en next-item.
+
+
+11. Catalogo Kedro sugerido
+---------------------------
+
+sasrec_model:
+  type: pickle.PickleDataset
+  filepath: data/06_models/sasrec_model.pkl
+
+sasrec_recommendations_top_k:
+  type: spark.SparkDataset
+  filepath: data/07_model_output/sasrec_recommendations_top_k.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+sasrec_ranking_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/sasrec_ranking_metrics.json
+
+sasrec_dataset_stats:
+  type: json.JSONDataset
+  filepath: data/08_reporting/sasrec_dataset_stats.json
+
+
+12. Parametros sugeridos
+------------------------
+
+recommender_sasrec:
+  data:
+    max_seq_len: 50
+    min_sequence_length: 3
+    item_id_offset: 1
+    test_history_policy: train_plus_validation
+
+  model:
+    hidden_size: 64
+    inner_size: 256
+    n_layers: 2
+    n_heads: 2
+    dropout: 0.2
+    learning_rate: 0.001
+    batch_size: 256
+    epochs: 50
+    seed: 42
+    loss_type: sampled_bce
+    model_path: data/06_models/sasrec_model.pt
+
+  recommendations:
+    k: 20
+    score_batch_size: 256
+
+  evaluation:
+    k_values: [10, 20]
+
+
+13. Pseudocodigo de entrenamiento
+---------------------------------
+
+Input: secuencias ordenadas por usuario
+
+1. Para cada usuario, construir ejemplos:
+   input_seq = historial hasta t
+   pos_item = item en t + 1
+   neg_item = item no observado por el usuario
+2. Pad/truncate input_seq a max_seq_len.
+3. Forward:
+   a. item_embedding(input_seq)
+   b. sumar positional_embedding
+   c. aplicar mascara padding
+   d. pasar por bloques de self-attention causal
+   e. obtener representacion de cada posicion
+4. Calcular score positivo y score negativo.
+5. Optimizar loss.
+6. Evaluar validation cada N epochs.
+7. Guardar mejor modelo.
+
+
+14. Inferencia top-K
+--------------------
+
+Para cada usuario de test:
+
+1. Construir historial disponible segun politica definida.
+2. Aplicar padding/truncation.
+3. Forward del modelo.
+4. Tomar hidden state de la ultima posicion valida.
+5. Calcular scores contra todos los items candidatos.
+6. Eliminar padding id 0.
+7. Excluir items vistos por el usuario.
+8. Seleccionar top-K.
+9. Convertir ids internos a item_idx original.
+
+Salida:
+
+user_idx, item_idx, score, rank
+
+
+15. Riesgos tecnicos
+--------------------
+
+1. Data leakage:
+   Es el riesgo mas importante. Si una secuencia de entrenamiento contiene
+   validation o test, la evaluacion queda contaminada.
+
+2. Usuarios con historiales cortos:
+   SASRec necesita contexto. Usuarios con 1 o 2 interacciones aportan poco. El
+   filtro min_user_interactions del pipeline actual ayuda.
+
+3. Padding e ids:
+   El id 0 debe reservarse para padding. Hay que desplazar item_idx y revertirlo
+   al generar recomendaciones.
+
+4. Costo de scoring:
+   Scoring contra todos los items puede ser caro. Usar batches.
+
+5. Comparabilidad:
+   SASRec optimiza next-item. ALS y LightGCN optimizan afinidad general. La
+   comparacion por Recall@K es valida, pero hay que explicar que SASRec usa
+   informacion secuencial que los otros modelos ignoran.
+
+6. Dependencias:
+   PyTorch o RecBole anaden peso al entorno. Conviene decidir si se acepta esa
+   dependencia antes de implementar.
+
+
+16. Tests recomendados
+----------------------
+
+Tests unitarios:
+
+- Las secuencias de cada usuario estan ordenadas por timestamp ascendente.
+- El padding usa id 0.
+- Ningun target aparece en su propio input futuro.
+- item_idx se desplaza y se revierte correctamente.
+- La salida top-K no contiene items vistos.
+
+Tests de integracion:
+
+- kedro run --pipeline recommender_sasrec con dataset pequeno.
+- Validar columnas de salida: user_idx, item_idx, score, rank.
+- Confirmar max rank <= k por usuario.
+- Comparar Recall@10 y Recall@20 contra ALS y popularidad.
+
+Metricas minimas:
+
+- recall@10
+- recall@20
+- hitrate@10, opcional
+- ndcg@10, opcional
+- tiempo de entrenamiento
+- tiempo de inferencia
+
+
+17. Resultado esperado
+----------------------
+
+SASRec deberia ser especialmente competitivo si el orden de compra/review en
+Amazon Video Games contiene patrones claros: por ejemplo, usuarios que compran
+un juego y despues accesorios, expansiones, juegos de la misma saga o productos
+similares.
+
+La primera implementacion debe buscar una comparacion limpia:
+
+- Mismo split temporal.
+- Mismos usuarios de test.
+- Mismo k.
+- Misma exclusion de items vistos.
+- Reporte conjunto ALS vs Popularity vs LightGCN vs SASRec.
+
+Si SASRec no supera a ALS/LightGCN, no significa necesariamente que este mal:
+puede indicar que el dataset filtrado tiene historiales demasiado cortos o que
+la senal colaborativa global pesa mas que la secuencia reciente.

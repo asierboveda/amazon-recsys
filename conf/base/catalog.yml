@@ -117,3 +117,98 @@ popularity_ranking_metrics:
 als_metrics_comparison:
   type: json.JSONDataset
   filepath: data/08_reporting/als_metrics_comparison.json
+
+# ============================================================
+# 4. recommender_lightgcn outputs
+# ============================================================
+
+lightgcn_train_interactions:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/lightgcn_train_interactions.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+lightgcn_validation_interactions:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/lightgcn_validation_interactions.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+lightgcn_test_interactions:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/lightgcn_test_interactions.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+lightgcn_dataset_stats:
+  type: json.JSONDataset
+  filepath: data/08_reporting/lightgcn_dataset_stats.json
+
+lightgcn_model:
+  type: pickle.PickleDataset
+  filepath: data/06_models/lightgcn_model.pkl
+
+lightgcn_recommendations_top_k:
+  type: spark.SparkDataset
+  filepath: data/07_model_output/lightgcn_recommendations_top_k.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+lightgcn_ranking_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/lightgcn_ranking_metrics.json
+
+# ============================================================
+# 5. recommender_sasrec outputs
+# ============================================================
+
+sasrec_train_sequences:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/sasrec_train_sequences.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+sasrec_validation_sequences:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/sasrec_validation_sequences.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+sasrec_test_sequences:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/sasrec_test_sequences.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+sasrec_seen_items:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/sasrec_seen_items.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+sasrec_dataset_stats:
+  type: json.JSONDataset
+  filepath: data/08_reporting/sasrec_dataset_stats.json
+
+sasrec_model:
+  type: pickle.PickleDataset
+  filepath: data/06_models/sasrec_model.pkl
+
+sasrec_recommendations_top_k:
+  type: spark.SparkDataset
+  filepath: data/07_model_output/sasrec_recommendations_top_k.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+sasrec_ranking_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/sasrec_ranking_metrics.json
