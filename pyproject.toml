@@ -17,8 +17,10 @@ dependencies = [
     "scikit-learn~=1.5.1",
     "seaborn~=0.12.1",
     "datasets>=4.8.5",
+    "dash>=2.17.0",
     "hdfs>=2.7.3",
     "pyspark==3.5.3",
+    "plotly>=5.0",
     "torch>=2.0",
 ]
 

@@ -6,4 +6,6 @@ kedro-datasets[pandas-csvdataset, pandas-exceldataset, pandas-parquetdataset, pl
 kedro-viz>=6.7.0
 scikit-learn~=1.5.1
 seaborn~=0.12.1
+dash>=2.17.0
+plotly>=5.0
 torch>=2.0
