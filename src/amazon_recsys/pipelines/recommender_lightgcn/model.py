@@ -89,6 +89,12 @@ class LightGCN:
         self.user_embedding.load_state_dict(state["user_embedding"])
         self.item_embedding.load_state_dict(state["item_embedding"])
 
+    def to(self, device):
+        """Mueve los embeddings de usuarios e items a la tarjeta gráfica."""
+        self.user_embedding.to(device)
+        self.item_embedding.to(device)
+        return self
+
     def propagate(self, normalized_adj):
         """Return final user and item embeddings after LightGCN propagation."""
         torch = require_torch()

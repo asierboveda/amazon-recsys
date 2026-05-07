@@ -96,6 +96,9 @@ def train_lightgcn_model(
     """Train a LightGCN model and persist the PyTorch checkpoint."""
     torch = require_torch()
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Starting LightGCN training on: {device}")
+
     seed = int(model_params.get("seed", 42))
     random.seed(seed)
     torch.manual_seed(seed)
@@ -115,8 +118,8 @@ def train_lightgcn_model(
         embedding_dim=int(model_params.get("embedding_dim", 64)),
         n_layers=int(model_params.get("n_layers", 3)),
     )
-    model = LightGCN(config)
-    normalized_adj = build_normalized_adj(train_pairs, num_users, num_items)
+    model = LightGCN(config).to(device)
+    normalized_adj = build_normalized_adj(train_pairs, num_users, num_items).to(device)
 
     positives_by_user: dict[int, set[int]] = {}
     for user_idx, item_idx in train_pairs:
@@ -130,7 +133,10 @@ def train_lightgcn_model(
     reg_weight = float(model_params.get("reg_weight", 1e-4))
 
     last_loss = 0.0
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        
+        print(f"Training epoch {epoch + 1}/{epochs} (last loss: {last_loss:.4f})")
+        
         random.shuffle(train_pairs)
         for start in range(0, len(train_pairs), batch_size):
             batch = train_pairs[start : start + batch_size]
@@ -142,9 +148,10 @@ def train_lightgcn_model(
             ]
 
             user_final, item_final = model.propagate(normalized_adj)
-            user_tensor = torch.tensor(users, dtype=torch.long)
-            pos_tensor = torch.tensor(positives, dtype=torch.long)
-            neg_tensor = torch.tensor(negatives, dtype=torch.long)
+            
+            user_tensor = torch.tensor(users, dtype=torch.long).to(device)
+            pos_tensor = torch.tensor(positives, dtype=torch.long).to(device)
+            neg_tensor = torch.tensor(negatives, dtype=torch.long).to(device)
 
             loss = bpr_loss(
                 user_final[user_tensor],
@@ -152,6 +159,7 @@ def train_lightgcn_model(
                 item_final[neg_tensor],
                 reg_weight,
             )
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

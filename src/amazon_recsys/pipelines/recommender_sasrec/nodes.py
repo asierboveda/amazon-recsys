@@ -281,21 +281,36 @@ def generate_sasrec_recommendations(
     for row in sasrec_seen_items.collect():
         seen_by_user.setdefault(int(row["user_idx"]), set()).add(int(row["item_idx"]))
 
+    # Obtenemos el ID máximo que conoce nuestro diccionario
+    num_items = int(sasrec_model["num_items"])
+
     rows = sasrec_test_sequences.collect()
     output_rows = []
+    
     with torch.no_grad():
         for row in rows:
             user_idx = int(row["user_idx"])
-            sequence = _pad_left(list(row["sequence"]), max_seq_len)
+            
+            # Si el juego es mayor que num_items, lo convertimos en 0 (ignorado)
+            secuencia_cruda = list(row["sequence"])
+            secuencia_limpia = [idx if idx <= num_items else 0 for idx in secuencia_cruda]
+            
+            sequence = _pad_left(secuencia_limpia, max_seq_len)
+            
+            # Nota: Lo dejamos en CPU porque predecir usuario por usuario 
+            # es más rápido en el procesador que enviándolo a la gráfica de 1 en 1.
             tensor = torch.tensor([sequence], dtype=torch.long)
             scores = model.scores(tensor)[0]
             scores[0] = -float("inf")
+            
             for seen_item in seen_by_user.get(user_idx, set()):
                 internal_item = seen_item + item_id_offset
                 if internal_item < len(scores):
                     scores[internal_item] = -float("inf")
+                    
             limit = min(k, len(scores) - 1)
             values, indices = torch.topk(scores, k=limit)
+            
             for rank, (score, internal_item) in enumerate(zip(values, indices), start=1):
                 if torch.isinf(score):
                     continue
