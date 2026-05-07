@@ -156,6 +156,9 @@ def train_sasrec_model(
     """Train a SASRec model and persist the PyTorch checkpoint."""
     torch = require_torch()
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Starting SASRec training on: {device}")
+
     seed = int(model_params.get("seed", 42))
     random.seed(seed)
     torch.manual_seed(seed)
@@ -178,6 +181,7 @@ def train_sasrec_model(
         dropout=float(model_params.get("dropout", 0.2)),
     )
     model = SASRecModel(config)
+    model.module.to(device)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=float(model_params.get("learning_rate", 0.001))
     )
@@ -192,23 +196,30 @@ def train_sasrec_model(
         random.shuffle(examples)
         for start in range(0, len(examples), batch_size):
             batch = examples[start : start + batch_size]
-            sequences = torch.tensor([seq for seq, _ in batch], dtype=torch.long)
-            pos_items = torch.tensor([target for _, target in batch], dtype=torch.long)
+            
+            # 1. Aseguramos que los 3 tensores de datos van a la gráfica
+            sequences = torch.tensor([seq for seq, _ in batch], dtype=torch.long).to(device)
+            pos_items = torch.tensor([target for _, target in batch], dtype=torch.long).to(device)
             neg_items = torch.tensor(
                 [_sample_negative(num_items, positives) for _ in batch],
                 dtype=torch.long,
-            )
+            ).to(device)
 
             output = model.sequence_output(sequences)
             lengths = (sequences != 0).sum(dim=1).clamp(min=1) - 1
-            final = output[torch.arange(sequences.shape[0]), lengths]
+            
+            # 2. LA TRAMPA: torch.arange crea tensores en CPU por defecto, le forzamos el device
+            final = output[torch.arange(sequences.shape[0], device=device), lengths]
+            
             item_weights = model.module.item_embedding.weight
             pos_scores = (final * item_weights[pos_items]).sum(dim=1)
             neg_scores = (final * item_weights[neg_items]).sum(dim=1)
+            
             logits = torch.cat([pos_scores, neg_scores])
             labels = torch.cat(
                 [torch.ones_like(pos_scores), torch.zeros_like(neg_scores)]
             )
+            
             loss = loss_fn(logits, labels)
             optimizer.zero_grad()
             loss.backward()

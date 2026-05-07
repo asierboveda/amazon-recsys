@@ -48,6 +48,11 @@ class SASRecModel:
     def load_state_dict(self, state: dict) -> None:
         self.module.load_state_dict(state)
 
+    def to(self, device):
+        """Mueve el modelo (y sus pesos) a la CPU o GPU indicada."""
+        self.module.to(device)
+        return self
+
     def train(self) -> None:
         self.module.train()
 
