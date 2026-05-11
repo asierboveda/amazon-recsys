@@ -14,6 +14,7 @@ recommender_als:
 
   recommendations:
     k: 20
+    num_candidates: 40
 
   evaluation:
     k_values: [10, 20]
@@ -35,7 +36,9 @@ recommender_lightgcn:
     learning_rate: 0.001
     reg_weight: 0.0001
     batch_size: 2048
-    epochs: 50
+    epochs: 200
+    patience: 15
+    min_delta: 0.0001
     seed: 42
     model_path: data/06_models/lightgcn_model.pt
 
@@ -63,7 +66,9 @@ recommender_sasrec:
     dropout: 0.2
     learning_rate: 0.001
     batch_size: 256
-    epochs: 50
+    epochs: 200
+    patience: 15
+    min_delta: 0.0001
     seed: 42
     model_path: data/06_models/sasrec_model.pt
 

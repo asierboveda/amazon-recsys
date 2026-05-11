@@ -5,10 +5,13 @@ The trained ALS model is persisted to disk via Spark's native save/load
 because Kedro's pickle-based serialisation cannot round-trip ALSModel.
 """
 
+from collections import defaultdict
+
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.recommendation import ALS, ALSModel
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
 
@@ -74,38 +77,77 @@ def _load_model(model_info: dict) -> ALSModel:
 
 
 def generate_als_recommendations(
-    model_info: dict, als_test: DataFrame, recommender_params: dict
+    model_info: dict, als_train: DataFrame, als_test: DataFrame, recommender_params: dict
 ) -> DataFrame:
     """Generate top-K recommendations for every user present in the test set.
 
     Uses recommendForUserSubset so only test users receive recommendations.
+    Items already seen in training are excluded from the final output.
 
     Args:
         model_info:          Dictionary returned by train_als_explicit_model.
+        als_train:           Training interactions used to filter already-seen items.
         als_test:            Test-set interactions (at least user_idx column).
-        recommender_params:  Dict with `k` (int) — number of recs per user.
+        recommender_params:  Dict with `k` (int) and `num_candidates` (int).
 
     Returns:
         DataFrame with columns [user_idx, item_idx, score, rank].
     """
+    spark = SparkSession.builder.getOrCreate()
     k = recommender_params.get("k", 20)
+    num_candidates = int(recommender_params.get("num_candidates", k * 2))
     model = _load_model(model_info)
 
-    users = als_test.select("user_idx").distinct()
+    users = als_test.select(F.col("user_idx").cast("int")).distinct()
 
-    raw_recs = model.recommendForUserSubset(users, k)
-
-    recs = raw_recs.withColumn("rec", F.explode("recommendations"))
-    recs = recs.select(
-        F.col("user_idx"),
-        F.col("rec.item_idx").cast("int").alias("item_idx"),
-        F.col("rec.rating").alias("score"),
+    # Job 1: ALS scoring — executed in isolation to avoid combined memory pressure
+    recs_rows = (
+        model.recommendForUserSubset(users, num_candidates)
+        .withColumn("rec", F.explode("recommendations"))
+        .select(
+            F.col("user_idx").cast("int"),
+            F.col("rec.item_idx").cast("int").alias("item_idx"),
+            F.col("rec.rating").cast("double").alias("score"),
+        )
+        .collect()
     )
 
-    window = Window.partitionBy("user_idx").orderBy(F.col("score").desc())
-    recs = recs.withColumn("rank", F.row_number().over(window))
+    # Job 2: Seen items for test users only — separate job, much smaller than full als_train
+    seen_rows = (
+        als_train
+        .join(users, "user_idx", "inner")
+        .select(F.col("user_idx").cast("int"), F.col("item_idx").cast("int"))
+        .distinct()
+        .collect()
+    )
 
-    return recs
+    # Python-side filtering and ranking (no Spark memory pressure)
+    seen_by_user: dict[int, set[int]] = defaultdict(set)
+    for row in seen_rows:
+        seen_by_user[row.user_idx].add(row.item_idx)
+
+    recs_by_user: dict[int, list] = defaultdict(list)
+    for row in recs_rows:
+        recs_by_user[row.user_idx].append((row.score, row.item_idx))
+
+    output_rows: list[tuple] = []
+    for uid, items in recs_by_user.items():
+        items.sort(reverse=True)
+        rank = 0
+        for score, iid in items:
+            if iid not in seen_by_user[uid]:
+                rank += 1
+                output_rows.append((uid, iid, score, rank))
+                if rank >= k:
+                    break
+
+    schema = T.StructType([
+        T.StructField("user_idx", T.IntegerType(), False),
+        T.StructField("item_idx", T.IntegerType(), False),
+        T.StructField("score", T.DoubleType(), False),
+        T.StructField("rank", T.IntegerType(), False),
+    ])
+    return spark.createDataFrame(output_rows, schema=schema)
 
 
 def evaluate_rmse(model_info: dict, als_validation: DataFrame) -> dict:

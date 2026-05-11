@@ -130,12 +130,14 @@ def _pad_left(sequence: list[int], max_seq_len: int) -> list[int]:
     return [0] * (max_seq_len - len(sequence)) + sequence
 
 
-def _training_examples(rows, max_seq_len: int) -> list[tuple[list[int], int]]:
+def _training_examples(rows, max_seq_len: int) -> list[tuple[list[int], int, int]]:
+    """Returns (padded_history, target_item, user_idx) triples."""
     examples = []
     for row in rows:
+        user_idx = int(row["user_idx"])
         sequence = list(row["sequence"])
         for pos in range(1, len(sequence)):
-            examples.append((_pad_left(sequence[:pos], max_seq_len), sequence[pos]))
+            examples.append((_pad_left(sequence[:pos], max_seq_len), sequence[pos], user_idx))
     return examples
 
 
@@ -186,45 +188,72 @@ def train_sasrec_model(
         model.parameters(), lr=float(model_params.get("learning_rate", 0.001))
     )
     batch_size = int(model_params.get("batch_size", 256))
-    epochs = int(model_params.get("epochs", 50))
+    epochs = int(model_params.get("epochs", 200))
+    patience = int(model_params.get("patience", 15))
+    min_delta = float(model_params.get("min_delta", 1e-4))
 
-    positives = {target for _, target in examples}
+    positives_by_user: dict[int, set[int]] = {}
+    for row in rows:
+        user_idx = int(row["user_idx"])
+        positives_by_user[user_idx] = set(row["sequence"]) - {0}
+        positives_by_user[user_idx].add(int(row["target_item"]))
+
+    best_loss = float("inf")
+    epochs_no_improve = 0
     last_loss = 0.0
     loss_fn = torch.nn.BCEWithLogitsLoss()
     model.train()
-    for _ in range(epochs):
+    for epoch in range(epochs):
         random.shuffle(examples)
+        epoch_loss = 0.0
+        num_batches = 0
         for start in range(0, len(examples), batch_size):
             batch = examples[start : start + batch_size]
-            
-            # 1. Aseguramos que los 3 tensores de datos van a la gráfica
-            sequences = torch.tensor([seq for seq, _ in batch], dtype=torch.long).to(device)
-            pos_items = torch.tensor([target for _, target in batch], dtype=torch.long).to(device)
+
+            sequences = torch.tensor([seq for seq, _, _ in batch], dtype=torch.long).to(device)
+            pos_items = torch.tensor([target for _, target, _ in batch], dtype=torch.long).to(device)
             neg_items = torch.tensor(
-                [_sample_negative(num_items, positives) for _ in batch],
+                [_sample_negative(num_items, positives_by_user[user_idx]) for _, _, user_idx in batch],
                 dtype=torch.long,
             ).to(device)
 
             output = model.sequence_output(sequences)
             lengths = (sequences != 0).sum(dim=1).clamp(min=1) - 1
-            
-            # 2. LA TRAMPA: torch.arange crea tensores en CPU por defecto, le forzamos el device
             final = output[torch.arange(sequences.shape[0], device=device), lengths]
-            
+
             item_weights = model.module.item_embedding.weight
             pos_scores = (final * item_weights[pos_items]).sum(dim=1)
             neg_scores = (final * item_weights[neg_items]).sum(dim=1)
-            
+
             logits = torch.cat([pos_scores, neg_scores])
             labels = torch.cat(
                 [torch.ones_like(pos_scores), torch.zeros_like(neg_scores)]
             )
-            
+
             loss = loss_fn(logits, labels)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            last_loss = float(loss.detach().cpu())
+            epoch_loss += float(loss.detach().cpu())
+            num_batches += 1
+
+        avg_loss = epoch_loss / max(num_batches, 1)
+        if avg_loss < best_loss - min_delta:
+            best_loss = avg_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} | loss: {avg_loss:.4f} | "
+            f"best: {best_loss:.4f} | patience: {epochs_no_improve}/{patience}"
+        )
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch + 1}.")
+            break
+
+        last_loss = avg_loss
 
     model_path = Path(model_params.get("model_path", "data/06_models/sasrec_model.pt"))
     model_path.parent.mkdir(parents=True, exist_ok=True)

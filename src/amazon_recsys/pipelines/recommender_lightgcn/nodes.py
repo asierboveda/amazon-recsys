@@ -129,16 +129,21 @@ def train_lightgcn_model(
         model.parameters(), lr=float(model_params.get("learning_rate", 0.001))
     )
     batch_size = int(model_params.get("batch_size", 2048))
-    epochs = int(model_params.get("epochs", 50))
+    epochs = int(model_params.get("epochs", 200))
     reg_weight = float(model_params.get("reg_weight", 1e-4))
+    patience = int(model_params.get("patience", 15))
+    min_delta = float(model_params.get("min_delta", 1e-4))
 
+    best_loss = float("inf")
+    epochs_no_improve = 0
     last_loss = 0.0
     for epoch in range(epochs):
-        
-        print(f"Training epoch {epoch + 1}/{epochs} (last loss: {last_loss:.4f})")
-        
+        user_final, item_final = model.propagate(normalized_adj)
         random.shuffle(train_pairs)
-        for start in range(0, len(train_pairs), batch_size):
+        batch_starts = list(range(0, len(train_pairs), batch_size))
+        epoch_loss = 0.0
+
+        for batch_num, start in enumerate(batch_starts):
             batch = train_pairs[start : start + batch_size]
             users = [user_idx for user_idx, _ in batch]
             positives = [item_idx for _, item_idx in batch]
@@ -147,8 +152,6 @@ def train_lightgcn_model(
                 for user_idx in users
             ]
 
-            user_final, item_final = model.propagate(normalized_adj)
-            
             user_tensor = torch.tensor(users, dtype=torch.long).to(device)
             pos_tensor = torch.tensor(positives, dtype=torch.long).to(device)
             neg_tensor = torch.tensor(negatives, dtype=torch.long).to(device)
@@ -161,9 +164,28 @@ def train_lightgcn_model(
             )
 
             optimizer.zero_grad()
-            loss.backward()
+            is_last_batch = batch_num == len(batch_starts) - 1
+            loss.backward(retain_graph=not is_last_batch)
             optimizer.step()
-            last_loss = float(loss.detach().cpu())
+            epoch_loss += float(loss.detach().cpu())
+
+        avg_loss = epoch_loss / max(len(batch_starts), 1)
+        if avg_loss < best_loss - min_delta:
+            best_loss = avg_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} | loss: {avg_loss:.4f} | "
+            f"best: {best_loss:.4f} | patience: {epochs_no_improve}/{patience}"
+        )
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch + 1}.")
+            break
+
+        last_loss = avg_loss
 
     model_path = Path(model_params.get("model_path", "data/06_models/lightgcn_model.pt"))
     model_path.parent.mkdir(parents=True, exist_ok=True)
