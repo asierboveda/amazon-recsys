@@ -64,8 +64,9 @@ class SASRecModel:
 
     def scores(self, sequences):
         output = self.module(sequences)
-        lengths = (sequences != 0).sum(dim=1).clamp(min=1) - 1
-        final = output[self.torch.arange(sequences.shape[0]), lengths]
+        # Sequences are left-padded: the last position always holds the most
+        # recent real item, so we always read from index -1 (max_seq_len - 1).
+        final = output[:, -1]
         return final @ self.module.item_embedding.weight.T
 
 

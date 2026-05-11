@@ -61,10 +61,17 @@ def build_sasrec_sequences(
     test_history_policy = data_params.get(
         "test_history_policy", "train_plus_validation"
     )
+    positive_threshold = float(data_params.get("positive_threshold", 4.0))
 
-    train_by_user = _collect_user_sequences(als_train, item_id_offset)
-    validation_by_user = _collect_user_sequences(als_validation, item_id_offset)
-    test_by_user = _collect_user_sequences(als_test, item_id_offset)
+    # Keep only positive interactions for sequence building so SASRec learns
+    # to recommend items the user liked, consistent with LightGCN's approach.
+    train_pos = als_train.filter(F.col("rating") >= positive_threshold)
+    validation_pos = als_validation.filter(F.col("rating") >= positive_threshold)
+    test_pos = als_test.filter(F.col("rating") >= positive_threshold)
+
+    train_by_user = _collect_user_sequences(train_pos, item_id_offset)
+    validation_by_user = _collect_user_sequences(validation_pos, item_id_offset)
+    test_by_user = _collect_user_sequences(test_pos, item_id_offset)
 
     train_rows = []
     for user_idx, sequence in train_by_user.items():
@@ -91,9 +98,9 @@ def build_sasrec_sequences(
                 (user_idx, _truncate(history, max_seq_len), int(targets[0]))
             )
 
-    seen_source = als_train
+    seen_source = train_pos
     if test_history_policy == "train_plus_validation":
-        seen_source = als_train.unionByName(als_validation)
+        seen_source = train_pos.unionByName(validation_pos)
     seen_items = seen_source.select(
         F.col("user_idx").cast("int"),
         F.col("item_idx").cast("int"),
@@ -110,6 +117,7 @@ def build_sasrec_sequences(
         "min_sequence_length": min_sequence_length,
         "item_id_offset": item_id_offset,
         "test_history_policy": test_history_policy,
+        "positive_threshold": positive_threshold,
         "num_train_sequences": len(train_rows),
         "num_validation_sequences": len(validation_rows),
         "num_test_sequences": len(test_rows),
@@ -218,8 +226,8 @@ def train_sasrec_model(
             ).to(device)
 
             output = model.sequence_output(sequences)
-            lengths = (sequences != 0).sum(dim=1).clamp(min=1) - 1
-            final = output[torch.arange(sequences.shape[0], device=device), lengths]
+            # Sequences are left-padded: last position = most recent real item.
+            final = output[:, -1]
 
             item_weights = model.module.item_embedding.weight
             pos_scores = (final * item_weights[pos_items]).sum(dim=1)

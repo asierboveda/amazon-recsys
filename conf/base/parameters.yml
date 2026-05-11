@@ -7,17 +7,19 @@ recommender_als:
     rank: 50
     maxIter: 10
     regParam: 0.1
-    nonnegative: true
-    implicitPrefs: false
+    nonnegative: false
+    implicitPrefs: true
     coldStartStrategy: drop
     seed: 42
 
   recommendations:
     k: 20
-    num_candidates: 40
+    num_candidates: 200
+    user_batch_size: 500
 
   evaluation:
     k_values: [10, 20]
+    positive_threshold: 4.0
 
   popularity_baseline:
     score_by: interaction_count
@@ -56,6 +58,7 @@ recommender_sasrec:
     min_sequence_length: 1
     item_id_offset: 1
     test_history_policy: train_plus_validation
+    positive_threshold: 4.0
 
   model:
     max_seq_len: 50
