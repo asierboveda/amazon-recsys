@@ -117,3 +117,33 @@ popularity_ranking_metrics:
 als_metrics_comparison:
   type: json.JSONDataset
   filepath: data/08_reporting/als_metrics_comparison.json
+
+# ============================================================
+# 4. recommender_lightgcn outputs
+# ============================================================
+
+lightgcn_recommendations_top_k:
+  type: spark.SparkDataset
+  filepath: data/07_model_output/lightgcn_recommendations_top_k.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+lightgcn_ranking_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/lightgcn_ranking_metrics.json
+
+# ============================================================
+# 5. recommender_sasrec outputs
+# ============================================================
+
+sasrec_recommendations_top_k:
+  type: spark.SparkDataset
+  filepath: data/07_model_output/sasrec_recommendations_top_k.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+sasrec_ranking_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/sasrec_ranking_metrics.json

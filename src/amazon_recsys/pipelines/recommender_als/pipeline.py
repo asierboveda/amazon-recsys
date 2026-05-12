@@ -24,6 +24,7 @@ def create_pipeline(**kwargs) -> Pipeline:
                 func=generate_als_recommendations,
                 inputs=[
                     "als_explicit_model",
+                    "als_train",
                     "als_test",
                     "params:recommender_als.recommendations",
                 ],

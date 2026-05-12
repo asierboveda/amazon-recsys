@@ -5,10 +5,13 @@ The trained ALS model is persisted to disk via Spark's native save/load
 because Kedro's pickle-based serialisation cannot round-trip ALSModel.
 """
 
+from collections import defaultdict
+
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.recommendation import ALS, ALSModel
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
 
@@ -74,38 +77,85 @@ def _load_model(model_info: dict) -> ALSModel:
 
 
 def generate_als_recommendations(
-    model_info: dict, als_test: DataFrame, recommender_params: dict
+    model_info: dict, als_train: DataFrame, als_test: DataFrame, recommender_params: dict
 ) -> DataFrame:
     """Generate top-K recommendations for every user present in the test set.
 
-    Uses recommendForUserSubset so only test users receive recommendations.
+    Processes users in batches to limit driver memory usage.
+    Items already seen in training are excluded from the final output.
 
     Args:
         model_info:          Dictionary returned by train_als_explicit_model.
+        als_train:           Training interactions used to filter already-seen items.
         als_test:            Test-set interactions (at least user_idx column).
-        recommender_params:  Dict with `k` (int) — number of recs per user.
+        recommender_params:  Dict with `k` (int), `num_candidates` (int),
+                             `user_batch_size` (int).
 
     Returns:
         DataFrame with columns [user_idx, item_idx, score, rank].
     """
+    spark = SparkSession.builder.getOrCreate()
     k = recommender_params.get("k", 20)
+    num_candidates = int(recommender_params.get("num_candidates", 200))
+    user_batch_size = int(recommender_params.get("user_batch_size", 500))
     model = _load_model(model_info)
 
-    users = als_test.select("user_idx").distinct()
+    # Collect user list and seen items once (small data)
+    all_user_ids: list[int] = [
+        int(r["user_idx"])
+        for r in als_test.select(F.col("user_idx").cast("int")).distinct().collect()
+    ]
 
-    raw_recs = model.recommendForUserSubset(users, k)
-
-    recs = raw_recs.withColumn("rec", F.explode("recommendations"))
-    recs = recs.select(
-        F.col("user_idx"),
-        F.col("rec.item_idx").cast("int").alias("item_idx"),
-        F.col("rec.rating").alias("score"),
+    seen_rows = (
+        als_train
+        .select(F.col("user_idx").cast("int"), F.col("item_idx").cast("int"))
+        .distinct()
+        .collect()
     )
+    seen_by_user: dict[int, set[int]] = defaultdict(set)
+    for row in seen_rows:
+        seen_by_user[row.user_idx].add(row.item_idx)
 
-    window = Window.partitionBy("user_idx").orderBy(F.col("score").desc())
-    recs = recs.withColumn("rank", F.row_number().over(window))
+    schema = T.StructType([
+        T.StructField("user_idx", T.IntegerType(), False),
+        T.StructField("item_idx", T.IntegerType(), False),
+        T.StructField("score", T.DoubleType(), False),
+        T.StructField("rank", T.IntegerType(), False),
+    ])
 
-    return recs
+    output_rows: list[tuple] = []
+    for start in range(0, len(all_user_ids), user_batch_size):
+        batch_ids = all_user_ids[start : start + user_batch_size]
+        batch_df = spark.createDataFrame(
+            [(uid,) for uid in batch_ids],
+            schema=T.StructType([T.StructField("user_idx", T.IntegerType(), False)]),
+        )
+        recs_rows = (
+            model.recommendForUserSubset(batch_df, num_candidates)
+            .withColumn("rec", F.explode("recommendations"))
+            .select(
+                F.col("user_idx").cast("int"),
+                F.col("rec.item_idx").cast("int").alias("item_idx"),
+                F.col("rec.rating").cast("double").alias("score"),
+            )
+            .collect()
+        )
+
+        recs_by_user: dict[int, list] = defaultdict(list)
+        for row in recs_rows:
+            recs_by_user[row.user_idx].append((row.score, row.item_idx))
+
+        for uid, items in recs_by_user.items():
+            items.sort(reverse=True)
+            rank = 0
+            for score, iid in items:
+                if iid not in seen_by_user[uid]:
+                    rank += 1
+                    output_rows.append((uid, iid, score, rank))
+                    if rank >= k:
+                        break
+
+    return spark.createDataFrame(output_rows, schema=schema)
 
 
 def evaluate_rmse(model_info: dict, als_validation: DataFrame) -> dict:
@@ -178,16 +228,20 @@ def evaluate_ranking_metrics(
     Args:
         als_recommendations_top_k:  ALS recommendations.
         als_test:                   Test interactions (ground truth).
-        evaluation_params:          Dict with `k_values` (list of int).
+        evaluation_params:          Dict with `k_values` (list of int) and
+                                    optional `positive_threshold` (float, default 4.0).
 
     Returns:
         Dictionary mapping "recall@<k>" to the computed value.
     """
     k_values = evaluation_params.get("k_values", [10, 20])
+    threshold = float(evaluation_params.get("positive_threshold", 4.0))
+
+    ground_truth = als_test.filter(F.col("rating") >= threshold)
 
     metrics = {}
     for k in k_values:
-        recall = _compute_recall_at_k(als_recommendations_top_k, als_test, k)
+        recall = _compute_recall_at_k(als_recommendations_top_k, ground_truth, k)
         metrics[f"recall@{k}"] = round(recall, 6)
 
     return metrics

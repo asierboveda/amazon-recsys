@@ -1,0 +1,495 @@
+LIGHTGCN PARA AMAZON_RECSYS
+===========================
+
+Objetivo del documento
+----------------------
+
+Este documento explica LightGCN desde tres angulos:
+
+1. Que problema resuelve y por que es una buena evolucion despues de ALS.
+2. Cual es su estructura teorica: grafo, embeddings, propagacion, scoring y loss.
+3. Como implementarlo de forma limpia dentro del proyecto Kedro/Spark actual.
+
+Fuentes principales usadas:
+
+- Paper: "LightGCN: Simplifying and Powering Graph Convolution Network for Recommendation", Xiangnan He, Kuan Deng, Xiang Wang, Yan Li, Yongdong Zhang, Meng Wang. SIGIR 2020. arXiv: https://arxiv.org/abs/2002.02126
+- Codigo oficial TensorFlow: https://github.com/kuandeng/LightGCN
+- Documentacion RecBole: https://www.recbole.io/docs/v1.2.0/recbole/recbole.model.general_recommender.lightgcn.html
+
+
+1. Idea central
+---------------
+
+ALS aprende dos matrices latentes: una para usuarios y otra para items. La
+prediccion es normalmente un producto escalar entre el embedding del usuario y
+el embedding del item. Esto funciona bien como collaborative filtering, pero
+solo aprende factores latentes a partir de pares usuario-item observados.
+
+LightGCN mantiene esa idea de embeddings usuario/item, pero los aprende sobre
+el grafo bipartito de interacciones. En vez de entrenar solo con la matriz de
+ratings, representa el dataset como un grafo:
+
+- Un nodo por usuario.
+- Un nodo por item.
+- Una arista entre usuario e item si hay interaccion positiva.
+
+La mejora conceptual frente a ALS es que un usuario no solo queda representado
+por sus items directos; tambien recibe informacion de vecinos de varios saltos:
+
+- Usuario -> item comprado/reviewed.
+- Item -> otros usuarios que interactuaron con ese item.
+- Otros usuarios -> otros items relacionados por comportamiento colectivo.
+
+LightGCN es "light" porque elimina partes de GCN clasicas que el paper
+considera innecesarias para collaborative filtering: transformaciones densas de
+features y activaciones no lineales. Se queda con la propagacion vecinal y la
+combinacion de embeddings por capa.
+
+
+2. Cuando tiene sentido usarlo aqui
+-----------------------------------
+
+Encaja muy bien en este proyecto porque ya existen:
+
+- user_idx e item_idx generados por StringIndexer.
+- als_train, als_validation y als_test en Spark.
+- metricas ranking tipo Recall@K.
+- un baseline de popularidad.
+- una salida estandar de recomendaciones con columnas:
+  user_idx, item_idx, score, rank.
+
+LightGCN deberia compararse contra ALS y popularidad usando Recall@10 y
+Recall@20. RMSE no es una metrica natural para LightGCN si se entrena con BPR o
+implicit feedback, porque el modelo optimiza ranking, no prediccion exacta de
+rating.
+
+
+3. Datos de entrada
+-------------------
+
+LightGCN trabaja mejor como recomendador implicito. En este proyecto tenemos
+ratings explicitos de 1 a 5, asi que hay que convertirlos a interacciones
+positivas.
+
+Decision recomendada:
+
+- Usar como positivo todo rating >= 4.0 en el primer experimento.
+- Alternativa: usar todo rating observado como positivo si el dataset queda muy
+  disperso tras filtrar por rating >= 4.0.
+- Mantener el split temporal actual para no evaluar con informacion futura.
+- Entrenar solo con als_train.
+- Usar als_validation para early stopping o tuning.
+- Usar als_test para evaluacion final.
+
+Campos minimos:
+
+- user_idx: int consecutivo.
+- item_idx: int consecutivo.
+- rating: float, usado solo para filtrar positivos o ponderar.
+- timestamp: no lo usa el modelo directamente, pero si el split temporal.
+
+
+4. Estructura matematica
+------------------------
+
+4.1 Grafo bipartito
+
+Sea R la matriz usuario-item binaria:
+
+R[u, i] = 1 si el usuario u interactuo positivamente con el item i.
+R[u, i] = 0 en caso contrario.
+
+Construimos una matriz de adyacencia bipartita:
+
+A = [[0, R],
+     [R^T, 0]]
+
+Los nodos son todos los usuarios y todos los items. No hay aristas usuario-
+usuario ni item-item directas; esas relaciones emergen por caminos de varios
+saltos.
+
+4.2 Normalizacion
+
+La propagacion se hace con una version normalizada de la adyacencia:
+
+A_hat = D^(-1/2) A D^(-1/2)
+
+D es la matriz diagonal de grados. Esta normalizacion evita que nodos muy
+populares dominen completamente la propagacion.
+
+4.3 Embeddings iniciales
+
+LightGCN aprende embeddings iniciales:
+
+E_user^(0) in R^(num_users x dim)
+E_item^(0) in R^(num_items x dim)
+
+Se concatenan:
+
+E^(0) = [E_user^(0); E_item^(0)]
+
+Estos embeddings son parametros entrenables. No se necesitan features de texto,
+categorias ni imagenes.
+
+4.4 Propagacion por capas
+
+Para cada capa k:
+
+E^(k+1) = A_hat E^(k)
+
+No hay W_k E, no hay ReLU, no hay MLP. Cada capa mezcla informacion de vecinos.
+
+Interpretacion:
+
+- Capa 0: preferencia latente propia.
+- Capa 1: items directos de un usuario y usuarios directos de un item.
+- Capa 2: usuarios similares por items compartidos, items similares por usuarios
+  compartidos.
+- Capas posteriores: senales colaborativas mas lejanas.
+
+4.5 Embedding final
+
+El embedding final no usa solo la ultima capa. Combina capas:
+
+E_final = sum_k alpha_k E^(k), para k = 0..K
+
+Una configuracion comun es alpha_k = 1 / (K + 1), es decir, media simple de las
+representaciones por capa.
+
+Esto ayuda porque:
+
+- La capa 0 conserva informacion individual.
+- Las capas intermedias capturan colaboracion local.
+- Demasiadas capas pueden suavizar demasiado los embeddings.
+
+4.6 Scoring
+
+Para recomendar un item i al usuario u:
+
+score(u, i) = dot(e_u_final, e_i_final)
+
+Despues se ordenan los items candidatos por score descendente y se selecciona
+top-K, excluyendo items vistos en train.
+
+
+5. Funcion de perdida
+---------------------
+
+La implementacion original usa una perdida pairwise tipo BPR. Para cada usuario
+se toma:
+
+- i: item positivo observado.
+- j: item negativo no observado.
+
+El objetivo empuja:
+
+score(u, i) > score(u, j)
+
+Forma conceptual:
+
+loss = -log sigmoid(score(u, i) - score(u, j)) + regularizacion
+
+Esto alinea el entrenamiento con ranking top-K, que es justo lo que medimos con
+Recall@K o NDCG@K.
+
+Importante:
+
+- ALS explicito optimiza reconstruccion/prediccion de ratings.
+- LightGCN con BPR optimiza orden relativo de items.
+- Por eso la comparacion justa debe ser ranking, no RMSE.
+
+
+6. Hiperparametros importantes
+------------------------------
+
+Recomendacion inicial para este repo:
+
+- embedding_dim: 64
+- n_layers: 2 o 3
+- learning_rate: 0.001
+- batch_size: 1024 o 2048
+- epochs: 50 como primer limite, con early stopping
+- reg_weight: 1e-4
+- k: 20, igual que ALS
+- positive_threshold: 4.0
+- seed: 42
+
+Que tocar primero:
+
+- Si Recall@K es bajo: probar threshold >= 3.0 o todos los ratings observados.
+- Si overfitting: subir reg_weight o dropout no aplica directamente en LightGCN
+  clasico; mejor early stopping.
+- Si tarda mucho: bajar epochs, batch_size o n_layers.
+- Si memoria explota: revisar construccion sparse de A_hat y full-sort scoring.
+
+
+7. Estructura de implementacion recomendada
+-------------------------------------------
+
+El proyecto actual esta basado en Kedro + PySpark. Spark ML no trae LightGCN
+nativo. La implementacion razonable es anadir PyTorch o usar RecBole como motor
+experimental.
+
+Opcion recomendada para el proyecto:
+
+- Implementar LightGCN en PyTorch dentro del repo.
+- Usar Spark solo para preparar datos y metricas agregadas.
+- Guardar el modelo como .pt y un metadata .json/.pkl.
+- Generar recomendaciones en batches para no crear una matriz usuario-item
+  completa en memoria.
+
+Nuevos archivos sugeridos:
+
+src/amazon_recsys/pipelines/recommender_lightgcn/__init__.py
+src/amazon_recsys/pipelines/recommender_lightgcn/model.py
+src/amazon_recsys/pipelines/recommender_lightgcn/nodes.py
+src/amazon_recsys/pipelines/recommender_lightgcn/pipeline.py
+tests/pipelines/recommender_lightgcn/test_pipeline.py
+
+Cambios de configuracion:
+
+conf/base/parameters.yml
+conf/base/catalog.yml
+src/amazon_recsys/pipeline_registry.py
+pyproject.toml o requirements.txt
+
+
+8. Nodos Kedro propuestos
+-------------------------
+
+8.1 prepare_lightgcn_interactions
+
+Inputs:
+
+- als_train
+- als_validation
+- als_test
+- params:recommender_lightgcn.data
+
+Outputs:
+
+- lightgcn_train_interactions
+- lightgcn_validation_interactions
+- lightgcn_test_interactions
+- lightgcn_dataset_stats
+
+Responsabilidad:
+
+- Filtrar positivos por rating >= positive_threshold.
+- Mantener user_idx e item_idx como enteros.
+- Calcular num_users y num_items.
+- Crear seen_items por usuario para excluir en recomendacion.
+
+8.2 train_lightgcn_model
+
+Inputs:
+
+- lightgcn_train_interactions
+- lightgcn_validation_interactions
+- params:recommender_lightgcn.model
+
+Output:
+
+- lightgcn_model
+
+Responsabilidad:
+
+- Construir grafo sparse.
+- Inicializar embeddings.
+- Entrenar con BPR.
+- Hacer negative sampling.
+- Guardar pesos en data/06_models/lightgcn_model.pt.
+- Devolver metadata ligera: path, dim, n_layers, num_users, num_items, seed.
+
+8.3 generate_lightgcn_recommendations
+
+Inputs:
+
+- lightgcn_model
+- lightgcn_train_interactions
+- als_test
+- params:recommender_lightgcn.recommendations
+
+Output:
+
+- lightgcn_recommendations_top_k
+
+Responsabilidad:
+
+- Cargar el modelo.
+- Obtener usuarios de test.
+- Calcular scores por batches.
+- Excluir items vistos en train.
+- Devolver user_idx, item_idx, score, rank.
+
+8.4 evaluate_lightgcn_ranking_metrics
+
+Inputs:
+
+- lightgcn_recommendations_top_k
+- als_test
+- params:recommender_lightgcn.evaluation
+
+Output:
+
+- lightgcn_ranking_metrics
+
+Responsabilidad:
+
+- Reusar la logica de Recall@K existente en recommender_als si se extrae a un
+  modulo comun.
+- Opcional: anadir NDCG@K y Precision@K.
+
+
+9. Catalogo Kedro sugerido
+--------------------------
+
+lightgcn_model:
+  type: pickle.PickleDataset
+  filepath: data/06_models/lightgcn_model.pkl
+
+lightgcn_recommendations_top_k:
+  type: spark.SparkDataset
+  filepath: data/07_model_output/lightgcn_recommendations_top_k.parquet
+  file_format: parquet
+  save_args:
+    mode: overwrite
+
+lightgcn_ranking_metrics:
+  type: json.JSONDataset
+  filepath: data/08_reporting/lightgcn_ranking_metrics.json
+
+
+10. Parametros sugeridos
+------------------------
+
+recommender_lightgcn:
+  data:
+    positive_threshold: 4.0
+
+  model:
+    embedding_dim: 64
+    n_layers: 3
+    learning_rate: 0.001
+    reg_weight: 0.0001
+    batch_size: 2048
+    epochs: 50
+    seed: 42
+    model_path: data/06_models/lightgcn_model.pt
+
+  recommendations:
+    k: 20
+    score_batch_size: 512
+
+  evaluation:
+    k_values: [10, 20]
+
+
+11. Pseudocodigo de entrenamiento
+---------------------------------
+
+Input: train positives (user_idx, item_idx)
+
+1. Build sparse normalized adjacency A_hat.
+2. Initialize user and item embeddings E_user, E_item.
+3. For each epoch:
+   a. Sample mini-batches (user, positive_item, negative_item).
+   b. Propagate embeddings:
+      E0 = concat(user_embeddings, item_embeddings)
+      E1 = A_hat * E0
+      E2 = A_hat * E1
+      E3 = A_hat * E2
+      E_final = mean(E0, E1, E2, E3)
+   c. Split E_final into user_final and item_final.
+   d. Compute pos_score and neg_score.
+   e. Optimize BPR loss.
+   f. Evaluate Recall@K on validation every N epochs.
+4. Save best model.
+
+
+12. Diferencias clave frente a ALS
+----------------------------------
+
+ALS:
+
+- Factorizacion matricial.
+- Puede entrenar explicit feedback con RMSE.
+- Implementacion Spark ML estable y distribuida.
+- Sencillo de integrar.
+- No modela explicitamente estructura multi-hop del grafo.
+
+LightGCN:
+
+- Collaborative filtering basado en grafo.
+- Optimiza ranking implicito con BPR.
+- Captura relaciones multi-hop usuario-item.
+- Necesita PyTorch/RecBole o implementacion propia.
+- Requiere negative sampling y cuidado con memoria.
+
+
+13. Riesgos tecnicos
+--------------------
+
+1. Escala y memoria:
+   El scoring full-sort usuario x items puede ser muy grande. Hay que generar
+   recomendaciones por batches.
+
+2. Evaluacion no comparable por RMSE:
+   No se debe vender como mejora si solo mejora Recall@K pero no tiene RMSE. Son
+   objetivos distintos.
+
+3. Datos negativos:
+   Los items no observados se tratan como negativos muestreados, pero realmente
+   son "desconocidos". Esto es normal en implicit recommendation, pero conviene
+   explicarlo.
+
+4. Cold start:
+   Usuarios o items no vistos en train no tienen embedding entrenado. En esos
+   casos hay que caer a popularidad o a otro fallback.
+
+5. Sobre-suavizado:
+   Muchas capas pueden hacer que los embeddings se parezcan demasiado. Empezar
+   con 2 o 3 capas.
+
+
+14. Como validar que esta bien implementado
+------------------------------------------
+
+Tests unitarios:
+
+- La preparacion filtra correctamente positivos.
+- El grafo contiene num_users + num_items nodos.
+- No hay recomendaciones de items vistos en train.
+- La salida respeta columnas: user_idx, item_idx, score, rank.
+- rank empieza en 1 y no supera k por usuario.
+
+Tests de integracion:
+
+- kedro run --pipeline recommender_lightgcn en dataset pequeno.
+- Comparar Recall@10 y Recall@20 contra popularidad y ALS.
+- Confirmar reproducibilidad con seed fijo.
+
+Metricas minimas:
+
+- recall@10
+- recall@20
+- ndcg@10, si se anade
+- tiempo de entrenamiento
+- tiempo de generacion top-K
+
+
+15. Resultado esperado
+----------------------
+
+LightGCN deberia aportar una comparacion fuerte y moderna contra ALS en el mismo
+espacio collaborative filtering. Si el dataset tiene suficientes interacciones
+por usuario e item, deberia ser competitivo en Recall@K. Si el dataset es muy
+disperso, puede necesitar threshold menos estricto o mas regularizacion.
+
+La primera implementacion debe priorizar comparabilidad:
+
+- Misma particion train/validation/test.
+- Mismos usuarios de test.
+- Mismos k_values.
+- Misma exclusion de items vistos.
+- Reporte conjunto ALS vs Popularity vs LightGCN.

@@ -1,0 +1,1237 @@
+MODELOS Y EVALUACION DEL SISTEMA DE RECOMENDACION AMAZON_RECSYS
+================================================================
+
+Objetivo del documento
+----------------------
+
+Este documento resume el sistema de recomendacion implementado en el proyecto:
+
+1. Datos utilizados y transformaciones principales.
+2. Organizacion de la implementacion en Kedro.
+3. Funcionamiento teorico y practico de los tres modelos:
+   - ALS
+   - LightGCN
+   - SASRec
+4. Esquemas de flujo de datos y de funcionamiento interno de cada modelo.
+5. Metricas de evaluacion utilizadas.
+6. Bibliografia y enlaces a papers/documentacion.
+
+No se interpretan resultados numericos aqui. La lectura de resultados se hara
+despues, a partir de los outputs de Kedro y del notebook de evaluacion.
+
+
+1. Contexto del problema
+------------------------
+
+El objetivo es construir un sistema de recomendacion para reviews de Amazon
+Video Games. El sistema recibe interacciones historicas usuario-item y aprende a
+ordenar productos que podrian ser relevantes para cada usuario.
+
+El problema se formula como recomendacion top-K:
+
+- Para cada usuario se genera una lista ordenada de K items.
+- Los items ya vistos en entrenamiento se excluyen de la recomendacion cuando el
+  modelo lo permite.
+- La evaluacion se realiza sobre interacciones futuras separadas mediante split
+  temporal.
+
+Esto es importante porque el objetivo real no es predecir exactamente una nota
+de 1 a 5, sino colocar items relevantes en posiciones altas.
+
+
+2. Datos utilizados
+-------------------
+
+2.1 Dataset raw
+
+El dataset raw esperado por el proyecto es:
+
+data/01_raw/video_games.parquet
+
+Columnas principales usadas:
+
+- user_id: identificador original del usuario.
+- parent_asin: identificador original del producto.
+- rating: valoracion explicita del usuario.
+- timestamp: momento de la interaccion.
+- verified_purchase: indicador de compra verificada.
+- helpful_vote: votos de utilidad de la review.
+
+No todos los modelos usan todas las columnas. Para recomendacion colaborativa se
+usan principalmente usuario, item, rating y timestamp.
+
+
+2.2 Seleccion de columnas
+
+El pipeline de data_processing transforma el raw en una tabla de interacciones:
+
+raw_video_games_reviews
+        |
+        v
+select_recommender_columns
+        |
+        v
+recsys_interactions_selected
+
+Salida conceptual:
+
+user_id | item_id | rating | timestamp | verified_purchase | helpful_vote
+
+Aqui se renombra parent_asin como item_id para que el resto del proyecto use una
+nomenclatura generica de recomendacion.
+
+
+2.3 Limpieza
+
+La limpieza elimina filas que no sirven para entrenar:
+
+- user_id nulo.
+- item_id nulo.
+- rating nulo.
+- rating fuera de [1, 5].
+- helpful_vote negativo se reemplaza por 0.
+
+Esquema:
+
+recsys_interactions_selected
+        |
+        v
+clean_recommender_interactions
+        |
+        v
+recsys_interactions_clean
+
+
+2.4 Deduplicacion usuario-item
+
+Si un usuario tiene varias interacciones con el mismo item, se conserva la mas
+reciente segun timestamp.
+
+Motivo:
+
+- ALS, LightGCN y SASRec esperan una senal clara por usuario-item.
+- Mantener duplicados puede sobreponderar artificialmente productos repetidos.
+
+Esquema:
+
+usuario u, item i:
+
+review antigua  ----\
+review reciente ----> se conserva esta
+
+
+2.5 Filtro de actividad minima
+
+Se filtran usuarios e items con poca actividad:
+
+- min_user_interactions
+- min_item_interactions
+
+Esto reduce ruido y evita casos donde no hay suficiente historial para entrenar
+o evaluar. En SASRec es especialmente importante, porque los usuarios con una
+sola interaccion no tienen secuencia suficiente para predecir un siguiente item.
+
+
+2.6 Indexado de ids
+
+Los ids originales son strings. Spark ALS y los modelos PyTorch trabajan mejor
+con ids enteros consecutivos.
+
+Transformacion:
+
+user_id  -> user_idx
+item_id  -> item_idx
+
+Ejemplo:
+
+user_id original       user_idx
+------------------------------
+A12XYZ                 0
+B99QWE                 1
+C45RTY                 2
+
+item_id original       item_idx
+------------------------------
+B000123                0
+B000456                1
+B000789                2
+
+Tambien se guardan los mappings:
+
+- user_id_mapping
+- item_id_mapping
+
+
+2.7 Split temporal
+
+El split no es aleatorio. Para cada usuario se ordenan las interacciones por
+timestamp descendente:
+
+- interaccion mas reciente: test
+- segunda mas reciente: validation
+- resto: train
+
+Esquema por usuario:
+
+tiempo ---------------------------------------------------->
+
+item_1     item_2     item_3     item_4     item_5
+train      train      train      valid      test
+
+Ventaja:
+
+- Simula mejor un caso real: entrenar con pasado y evaluar con futuro.
+
+Riesgo evitado:
+
+- Fuga temporal. Si se entrenase con interacciones posteriores al test, la
+  evaluacion seria artificialmente optimista.
+
+
+3. Estructura Kedro
+-------------------
+
+El proyecto esta organizado por pipelines. Cada pipeline contiene nodos puros
+que reciben datasets/parametros y devuelven datasets/metricas.
+
+Flujo general:
+
+raw data
+  |
+  v
+data_processing
+  |
+  +--> als_train
+  +--> als_validation
+  +--> als_test
+  |
+  +--> recommender_als
+  |
+  +--> recommender_lightgcn
+  |
+  +--> recommender_sasrec
+  |
+  v
+model outputs + metrics
+
+
+3.1 Pipeline data_processing
+
+Ficheros principales:
+
+- src/amazon_recsys/pipelines/data_processing/nodes.py
+- src/amazon_recsys/pipelines/data_processing/pipeline.py
+
+Datasets relevantes de salida:
+
+- recsys_interactions_selected
+- recsys_interactions_clean
+- recsys_interactions_deduplicated
+- recsys_interactions_filtered
+- recsys_interactions_indexed
+- user_id_mapping
+- item_id_mapping
+- als_train
+- als_validation
+- als_test
+
+
+3.2 Pipeline recommender_als
+
+Ficheros principales:
+
+- src/amazon_recsys/pipelines/recommender_als/nodes.py
+- src/amazon_recsys/pipelines/recommender_als/pipeline.py
+
+Salidas:
+
+- als_explicit_model
+- als_recommendations_top_k
+- als_regression_metrics
+- als_ranking_metrics
+- popularity_recommendations_top_k
+- popularity_ranking_metrics
+- als_metrics_comparison
+
+
+3.3 Pipeline recommender_lightgcn
+
+Ficheros principales:
+
+- src/amazon_recsys/pipelines/recommender_lightgcn/model.py
+- src/amazon_recsys/pipelines/recommender_lightgcn/nodes.py
+- src/amazon_recsys/pipelines/recommender_lightgcn/pipeline.py
+
+Salidas:
+
+- lightgcn_train_interactions
+- lightgcn_validation_interactions
+- lightgcn_test_interactions
+- lightgcn_dataset_stats
+- lightgcn_model
+- lightgcn_recommendations_top_k
+- lightgcn_ranking_metrics
+
+
+3.4 Pipeline recommender_sasrec
+
+Ficheros principales:
+
+- src/amazon_recsys/pipelines/recommender_sasrec/model.py
+- src/amazon_recsys/pipelines/recommender_sasrec/nodes.py
+- src/amazon_recsys/pipelines/recommender_sasrec/pipeline.py
+
+Salidas:
+
+- sasrec_train_sequences
+- sasrec_validation_sequences
+- sasrec_test_sequences
+- sasrec_seen_items
+- sasrec_dataset_stats
+- sasrec_model
+- sasrec_recommendations_top_k
+- sasrec_ranking_metrics
+
+
+3.5 Registro de pipelines
+
+El registro se define en:
+
+src/amazon_recsys/pipeline_registry.py
+
+Pipelines disponibles:
+
+- data_processing
+- recommender_als
+- recommender_lightgcn
+- recommender_sasrec
+- all_recommenders
+
+El pipeline por defecto ejecuta data_processing + recommender_als. Los modelos
+neuronales se ejecutan explicitamente para evitar entrenamientos pesados por
+accidente.
+
+Comandos:
+
+kedro run --pipeline data_processing
+kedro run --pipeline recommender_als
+kedro run --pipeline recommender_lightgcn
+kedro run --pipeline recommender_sasrec
+kedro run --pipeline all_recommenders
+
+
+4. Modelo 1: ALS
+----------------
+
+4.1 Idea general
+
+ALS significa Alternating Least Squares. Es un modelo de factorizacion
+matricial para collaborative filtering.
+
+La idea es aproximar la matriz usuario-item:
+
+             items
+          i1 i2 i3 i4
+usuarios
+u1        5  ?  4  ?
+u2        ?  3  ?  5
+u3        4  ?  ?  2
+
+por el producto de dos matrices latentes:
+
+R ~= P * Q^T
+
+donde:
+
+- P[u] es el vector latente del usuario u.
+- Q[i] es el vector latente del item i.
+- score(u, i) = dot(P[u], Q[i]).
+
+Esquema:
+
+usuario u -------------------> embedding usuario P[u]
+                                  |
+                                  | producto escalar
+                                  v
+item i ----------------------> embedding item Q[i]
+
+score(u, i) = afinidad estimada
+
+
+4.2 Entrenamiento ALS
+
+ALS alterna dos pasos:
+
+1. Fijar embeddings de items y resolver embeddings de usuarios.
+2. Fijar embeddings de usuarios y resolver embeddings de items.
+
+Esquema:
+
+Inicializar P, Q
+      |
+      v
+fijar Q, optimizar P
+      |
+      v
+fijar P, optimizar Q
+      |
+      v
+repetir maxIter veces
+
+
+4.3 Implementacion en el proyecto
+
+En este proyecto ALS no esta implementado desde cero. Se usa la implementacion
+oficial de Spark ML:
+
+pyspark.ml.recommendation.ALS
+
+Motivos:
+
+- Escala mejor que una version manual.
+- Trabaja de forma distribuida con Spark.
+- Integra parametros estandar como rank, maxIter, regParam y coldStartStrategy.
+
+Funcion principal:
+
+train_als_explicit_model(train, als_params)
+
+Entrada:
+
+- als_train con user_idx, item_idx, rating.
+
+Parametros principales:
+
+- rank: dimension de embeddings latentes.
+- maxIter: numero de iteraciones.
+- regParam: regularizacion.
+- nonnegative: fuerza factores no negativos.
+- implicitPrefs: en este proyecto se usa False para feedback explicito.
+- coldStartStrategy: drop para evitar predicciones NaN en evaluacion.
+
+Salida:
+
+- metadata del modelo.
+- modelo Spark guardado en data/06_models/als_model_spark.
+
+
+4.4 Generacion de recomendaciones
+
+ALS usa:
+
+model.recommendForUserSubset(users, k)
+
+Solo recomienda para usuarios presentes en test.
+
+Salida estandar:
+
+user_idx | item_idx | score | rank
+
+El score es la prediccion del modelo para el par usuario-item.
+
+
+4.5 Evaluacion ALS
+
+ALS tiene dos tipos de evaluacion:
+
+1. RMSE sobre validation.
+2. Recall@K sobre test.
+
+RMSE mide error de rating:
+
+RMSE = sqrt(mean((rating_real - rating_predicho)^2))
+
+Recall@K mide capacidad de recuperar items relevantes en top-K.
+
+Para comparar contra LightGCN y SASRec, Recall@K es mas importante que RMSE,
+porque LightGCN y SASRec optimizan ranking, no prediccion exacta de rating.
+
+
+5. Baseline de popularidad
+--------------------------
+
+Aunque el usuario pidio tres modelos principales, el proyecto tambien incluye un
+baseline de popularidad. Es importante porque permite saber si los modelos
+personalizados realmente aportan valor.
+
+Funcionamiento:
+
+1. Contar cuantas interacciones tiene cada item en train.
+2. Ordenar items por popularidad.
+3. Recomendar a cada usuario los items mas populares no vistos en train.
+
+Esquema:
+
+als_train
+   |
+   v
+count por item
+   |
+   v
+ranking global de popularidad
+   |
+   v
+top-K para cada usuario excluyendo vistos
+
+Salida:
+
+user_idx | item_idx | score | rank
+
+Donde score es el numero de interacciones del item.
+
+Uso:
+
+- Si ALS/LightGCN/SASRec no superan popularidad, el modelo puede no estar
+  aprendiendo personalizacion suficiente.
+
+
+6. Modelo 2: LightGCN
+---------------------
+
+6.1 Idea general
+
+LightGCN es un modelo de collaborative filtering basado en grafo.
+
+Representa los datos como un grafo bipartito:
+
+usuarios                         items
+
+u1 -------- i1
+u1 -------- i3
+u2 -------- i2
+u2 -------- i3
+u3 -------- i1
+
+Cada arista indica una interaccion positiva.
+
+En este proyecto, las interacciones positivas se obtienen filtrando ratings:
+
+rating >= positive_threshold
+
+Por defecto:
+
+positive_threshold = 4.0
+
+
+6.2 Diferencia con ALS
+
+ALS:
+
+- Aprende embeddings a partir de la matriz usuario-item.
+- No propaga informacion por caminos multi-hop.
+
+LightGCN:
+
+- Aprende embeddings propagando informacion en el grafo usuario-item.
+- Un usuario recibe informacion de sus items, de otros usuarios conectados a
+  esos items y de items relacionados por patrones de interaccion.
+
+Esquema multi-hop:
+
+u1 -> item A -> u2 -> item B
+
+Esto sugiere que item B puede ser relevante para u1 si comparten estructura de
+comportamiento con u2.
+
+
+6.3 Matriz de adyacencia
+
+Se construye una matriz de adyacencia bipartita:
+
+A = [ 0   R  ]
+    [ R^T 0  ]
+
+donde R es la matriz usuario-item binaria de interacciones positivas.
+
+Despues se normaliza:
+
+A_hat = D^(-1/2) A D^(-1/2)
+
+La normalizacion reduce el dominio de nodos muy populares.
+
+
+6.4 Propagacion LightGCN
+
+LightGCN elimina transformaciones densas y activaciones no lineales de GCN
+clasicas. Solo mantiene agregacion vecinal.
+
+E^(0) = embeddings iniciales usuario/item
+
+Para cada capa:
+
+E^(k+1) = A_hat E^(k)
+
+Embedding final:
+
+E_final = media(E^(0), E^(1), ..., E^(K))
+
+Esquema:
+
+embeddings iniciales
+        |
+        v
+propagacion capa 1: vecinos directos
+        |
+        v
+propagacion capa 2: vecinos de vecinos
+        |
+        v
+propagacion capa 3: informacion mas lejana
+        |
+        v
+media de capas = embedding final
+
+
+6.5 Scoring
+
+Para recomendar:
+
+score(u, i) = dot(embedding_final_usuario[u], embedding_final_item[i])
+
+Despues se ordenan items por score y se devuelven los top-K, excluyendo items
+vistos en train.
+
+
+6.6 Entrenamiento
+
+LightGCN se entrena con perdida BPR:
+
+- Para cada usuario se toma un item positivo i.
+- Se muestrea un item negativo j no visto.
+- Se fuerza score(u, i) > score(u, j).
+
+Formula conceptual:
+
+loss = -log sigmoid(score(u, i) - score(u, j)) + regularizacion
+
+Esquema:
+
+usuario u
+   |
+   +--> item positivo i  --> score positivo
+   |
+   +--> item negativo j  --> score negativo
+
+objetivo: score positivo > score negativo
+
+
+6.7 Implementacion en Kedro
+
+Nodos:
+
+prepare_lightgcn_interactions
+    - filtra ratings positivos.
+    - calcula num_users y num_items.
+    - guarda estadisticas.
+
+train_lightgcn_model
+    - recoge pares usuario-item positivos.
+    - construye A_hat sparse.
+    - inicializa embeddings PyTorch.
+    - entrena con BPR.
+    - guarda checkpoint .pt.
+    - devuelve metadata ligera a Kedro.
+
+generate_lightgcn_recommendations
+    - carga checkpoint.
+    - propaga embeddings.
+    - calcula scores por batches.
+    - excluye items vistos.
+    - devuelve user_idx, item_idx, score, rank.
+
+evaluate_lightgcn_ranking_metrics
+    - calcula Recall@K.
+
+Flujo:
+
+als_train / als_validation / als_test
+        |
+        v
+prepare_lightgcn_interactions
+        |
+        v
+train_lightgcn_model
+        |
+        v
+generate_lightgcn_recommendations
+        |
+        v
+evaluate_lightgcn_ranking_metrics
+
+
+7. Modelo 3: SASRec
+-------------------
+
+7.1 Idea general
+
+SASRec es un modelo de recomendacion secuencial basado en self-attention.
+
+Mientras ALS y LightGCN se centran en afinidad usuario-item general, SASRec usa
+el orden temporal de las interacciones.
+
+Pregunta que responde:
+
+"Dado el historial reciente de este usuario, cual es el siguiente item mas
+probable?"
+
+
+7.2 Datos secuenciales
+
+Para cada usuario se construye una secuencia ordenada por timestamp:
+
+usuario u:
+
+item_1 -> item_2 -> item_3 -> item_4 -> item_5
+
+SASRec recibe una ventana del historial y predice el siguiente item.
+
+Ejemplo:
+
+input:  [item_1, item_2, item_3]
+target: item_4
+
+input:  [item_2, item_3, item_4]
+target: item_5
+
+
+7.3 Padding e ids internos
+
+SASRec reserva el id 0 para padding:
+
+[0, 0, item_1, item_2, item_3]
+
+Como item_idx puede empezar en 0, el pipeline desplaza ids:
+
+item interno = item_idx + item_id_offset
+
+Por defecto:
+
+item_id_offset = 1
+
+Al generar recomendaciones, se resta el offset para volver a item_idx original.
+
+
+7.4 Arquitectura
+
+SASRec usa embeddings de items y embeddings de posicion:
+
+item_embedding(item_t) + position_embedding(t)
+
+Despues aplica bloques Transformer con mascara causal.
+
+Esquema:
+
+secuencia de items
+        |
+        v
+item embeddings
+        +
+position embeddings
+        |
+        v
+self-attention causal
+        |
+        v
+feed-forward + residuals
+        |
+        v
+representacion de la ultima posicion
+        |
+        v
+scores contra items candidatos
+
+
+7.5 Mascara causal
+
+La mascara causal impide que el modelo mire al futuro.
+
+Para una secuencia:
+
+posicion 1 puede ver: 1
+posicion 2 puede ver: 1, 2
+posicion 3 puede ver: 1, 2, 3
+
+No puede ver posiciones futuras.
+
+Esquema:
+
+          puede atender a
+          1  2  3  4
+pos 1     X
+pos 2     X  X
+pos 3     X  X  X
+pos 4     X  X  X  X
+
+Esto evita fuga de informacion durante entrenamiento.
+
+
+7.6 Entrenamiento
+
+La implementacion usa PyTorch y una perdida binaria con negative sampling.
+
+Para cada ejemplo:
+
+- secuencia de entrada.
+- item positivo: siguiente item real.
+- item negativo: item no observado/muestreado.
+
+Se calculan:
+
+score positivo = dot(hidden_final, embedding_item_positivo)
+score negativo = dot(hidden_final, embedding_item_negativo)
+
+Objetivo:
+
+- score positivo alto.
+- score negativo bajo.
+
+Esquema:
+
+historial usuario
+      |
+      v
+SASRec
+      |
+      v
+hidden final
+   |             |
+   v             v
+item positivo   item negativo
+score alto      score bajo
+
+
+7.7 Implementacion en Kedro
+
+Nodos:
+
+build_sasrec_sequences
+    - ordena interacciones por usuario y timestamp.
+    - construye secuencias train, validation y test.
+    - aplica max_seq_len.
+    - desplaza item_idx para reservar 0 como padding.
+    - construye sasrec_seen_items para excluir vistos.
+
+train_sasrec_model
+    - crea ejemplos secuencia -> siguiente item.
+    - entrena TransformerEncoder en PyTorch.
+    - guarda checkpoint .pt.
+    - devuelve metadata ligera.
+
+generate_sasrec_recommendations
+    - carga checkpoint.
+    - calcula scores para usuarios de test.
+    - excluye padding e items vistos.
+    - devuelve user_idx, item_idx, score, rank.
+
+evaluate_sasrec_ranking_metrics
+    - calcula Recall@K usando target_item como ground truth.
+
+Flujo:
+
+als_train / als_validation / als_test
+        |
+        v
+build_sasrec_sequences
+        |
+        v
+train_sasrec_model
+        |
+        v
+generate_sasrec_recommendations
+        |
+        v
+evaluate_sasrec_ranking_metrics
+
+
+8. Comparacion conceptual de modelos
+------------------------------------
+
+Tabla resumen:
+
+Modelo      Tipo                       Usa rating    Usa grafo    Usa orden temporal
+----------------------------------------------------------------------------------
+Popularity  baseline no personalizado  indirecto     no           no
+ALS         factorization CF           si            no           no
+LightGCN    graph CF                   como filtro   si           no
+SASRec      sequential recommender     indirecto     no           si
+
+
+8.1 Que aprende cada modelo
+
+ALS:
+
+- Afinidad usuario-item mediante factores latentes.
+- Bueno como baseline colaborativo fuerte y escalable.
+
+LightGCN:
+
+- Afinidad usuario-item enriquecida por estructura de grafo.
+- Captura relaciones multi-hop entre usuarios e items.
+
+SASRec:
+
+- Patrones secuenciales.
+- Captura dependencia entre items recientes y siguiente item.
+
+
+8.2 Esquema global comparativo
+
+                    +----------------+
+                    | interacciones  |
+                    | user-item-time |
+                    +-------+--------+
+                            |
+                            v
+                     split temporal
+                            |
+       +--------------------+--------------------+
+       |                    |                    |
+       v                    v                    v
+      ALS                LightGCN              SASRec
+ factorization          grafo CF           self-attention
+       |                    |                    |
+       v                    v                    v
+ recommendations       recommendations       recommendations
+       |                    |                    |
+       +--------------------+--------------------+
+                            |
+                            v
+                       metricas top-K
+
+
+9. Notebook de evaluacion
+-------------------------
+
+El notebook:
+
+notebooks/02_model_evaluation.ipynb
+
+compara los modelos sin reentrenarlos dentro del notebook. Parte de las salidas
+ya materializadas por Kedro.
+
+Motivo:
+
+- Evita cargar todo el dataset en memoria.
+- Evita repetir entrenamientos costosos.
+- Permite comparar solo modelos disponibles.
+- Permite usar una muestra pequena de usuarios de test.
+
+
+9.1 Muestreo para no saturar memoria
+
+El notebook usa:
+
+MAX_TEST_USERS = 1000
+SEED = 42
+
+Funcionamiento:
+
+1. Carga als_test.
+2. Filtra interacciones relevantes con rating >= POSITIVE_THRESHOLD.
+3. Selecciona usuarios de test de forma aleatoria reproducible.
+4. Filtra recomendaciones de cada modelo a esos usuarios.
+
+Esquema:
+
+als_test
+   |
+   v
+usuarios con rating relevante
+   |
+   v
+muestra reproducible de usuarios
+   |
+   v
+filtrado de recomendaciones por modelo
+   |
+   v
+metricas comparables
+
+
+9.2 Modelos evaluados en el notebook
+
+El notebook intenta comparar:
+
+- Popularity
+- ALS
+- LightGCN
+- SASRec
+
+Si algun dataset de recomendaciones no existe todavia, el modelo se marca como
+no disponible y se excluye de la comparacion.
+
+
+10. Metricas realizadas
+-----------------------
+
+10.1 Ground truth
+
+El ground truth de ranking se define como interacciones relevantes en test.
+
+En el notebook:
+
+relevante = rating >= POSITIVE_THRESHOLD
+
+Por defecto:
+
+POSITIVE_THRESHOLD = 4.0
+
+Esto significa que una recomendacion cuenta como acierto si el item recomendado
+aparece en las interacciones relevantes futuras del usuario.
+
+
+10.2 Recall@K
+
+Recall@K mide que proporcion de items relevantes del usuario aparecen en el top-K
+recomendado.
+
+Formula por usuario:
+
+Recall@K = hits@K / numero_items_relevantes
+
+Donde:
+
+- hits@K = items recomendados en top-K que tambien estan en ground truth.
+
+Ejemplo:
+
+Ground truth usuario u:
+
+{A, B, C}
+
+Top-5 recomendado:
+
+[A, X, Y, B, Z]
+
+hits@5 = 2
+Recall@5 = 2 / 3 = 0.6667
+
+Interpretacion:
+
+- Alto Recall@K indica que el modelo recupera muchos items relevantes.
+- Es una metrica adecuada cuando importa no perder items buenos.
+
+
+10.3 Precision@K
+
+Precision@K mide que proporcion del top-K recomendado es relevante.
+
+Formula:
+
+Precision@K = hits@K / K
+
+Ejemplo:
+
+Ground truth:
+
+{A, B, C}
+
+Top-5:
+
+[A, X, Y, B, Z]
+
+hits@5 = 2
+Precision@5 = 2 / 5 = 0.4
+
+Interpretacion:
+
+- Alta Precision@K indica que la lista tiene poco ruido.
+- Es util si se muestran pocas recomendaciones y cada posicion importa.
+
+
+10.4 NDCG@K
+
+NDCG@K mide no solo si hay aciertos, sino en que posicion aparecen.
+
+Un acierto en rank 1 vale mas que un acierto en rank 10.
+
+DCG@K:
+
+DCG@K = suma(ganancia_rank / log2(rank + 1))
+
+En este proyecto la ganancia es binaria:
+
+- 1 si el item es relevante.
+- 0 si no lo es.
+
+NDCG normaliza DCG dividiendolo por el DCG ideal:
+
+NDCG@K = DCG@K / IDCG@K
+
+Ejemplo:
+
+Top-5:
+
+rank 1: acierto
+rank 2: no acierto
+rank 3: acierto
+
+El acierto en rank 1 pesa mas que el de rank 3.
+
+Interpretacion:
+
+- NDCG alto indica que los aciertos aparecen arriba.
+- Es especialmente util para comparar ordenaciones.
+
+
+10.5 Catalog Coverage@K
+
+Catalog Coverage@K mide que porcentaje del catalogo aparece en alguna
+recomendacion top-K.
+
+Formula:
+
+Coverage@K = items_distintos_recomendados@K / items_distintos_catalogo
+
+Interpretacion:
+
+- Cobertura alta indica que el modelo recomienda una variedad mayor de items.
+- Cobertura baja puede indicar concentracion en pocos productos populares.
+
+Ejemplo:
+
+Si el catalogo tiene 1000 items y el modelo solo recomienda 50 items distintos
+en todos los top-K:
+
+Coverage@K = 50 / 1000 = 0.05
+
+
+10.6 Solapamiento entre modelos
+
+El notebook calcula Jaccard medio entre pares de modelos.
+
+Formula por usuario:
+
+Jaccard(A, B) = |topK_A interseccion topK_B| / |topK_A union topK_B|
+
+Ejemplo:
+
+Modelo A recomienda:
+
+{1, 2, 3, 4}
+
+Modelo B recomienda:
+
+{3, 4, 5, 6}
+
+Interseccion = {3, 4}
+Union = {1, 2, 3, 4, 5, 6}
+Jaccard = 2 / 6 = 0.3333
+
+Interpretacion:
+
+- Jaccard alto: modelos recomiendan cosas parecidas.
+- Jaccard bajo: modelos aportan listas distintas.
+
+Esta metrica no dice que modelo es mejor, sino si los modelos son redundantes o
+complementarios.
+
+
+10.7 RMSE
+
+RMSE se calcula para ALS sobre validation.
+
+Formula:
+
+RMSE = sqrt(mean((rating_real - rating_predicho)^2))
+
+Interpretacion:
+
+- Mide error de prediccion de rating.
+- Es util para ALS explicito.
+- No es la metrica principal para LightGCN/SASRec, porque esos modelos estan
+  orientados a ranking top-K.
+
+
+11. Como estudiar los resultados despues
+----------------------------------------
+
+Cuando se ejecuten los pipelines y el notebook, el analisis deberia hacerse en
+este orden:
+
+1. Ver que modelos estan disponibles.
+2. Revisar Recall@K y NDCG@K.
+3. Comparar contra Popularity.
+4. Revisar Precision@K para saber si las listas tienen ruido.
+5. Revisar Coverage@K para detectar concentracion en pocos items.
+6. Revisar Jaccard para saber si los modelos son redundantes.
+7. Mirar ejemplos de recomendaciones por usuario.
+
+Preguntas clave:
+
+- ALS supera claramente al baseline de popularidad?
+- LightGCN mejora el ranking frente a ALS?
+- SASRec aprovecha el orden temporal o queda por debajo?
+- Alguno tiene buena precision pero baja cobertura?
+- Dos modelos recomiendan casi lo mismo?
+- Hay indicios de cold start o de pocos historiales por usuario?
+
+
+12. Limitaciones actuales
+-------------------------
+
+1. ALS usa Spark ML, no una implementacion from scratch.
+
+2. LightGCN y SASRec usan PyTorch y recogen ciertas estructuras a memoria en
+   fases de entrenamiento/inferencia. Para datasets enormes habria que optimizar
+   sampling, batching y almacenamiento.
+
+3. El notebook evalua una muestra pequena por defecto para evitar problemas de
+   memoria. Para conclusiones finales hay que aumentar la muestra o evaluar todo
+   el test si el entorno lo permite.
+
+4. Las metricas dependen del umbral de relevancia. Cambiar
+   POSITIVE_THRESHOLD cambia el ground truth.
+
+5. SASRec depende mucho de la longitud de historiales. Si los usuarios tienen
+   pocas interacciones, puede no explotar bien su arquitectura secuencial.
+
+
+13. Bibliografia
+----------------
+
+[1] Spark MLlib Collaborative Filtering Documentation.
+    Apache Spark documentation.
+    Enlace: https://spark.apache.org/docs/3.5.7/ml-collaborative-filtering.html
+    Uso en el proyecto: referencia para la implementacion ALS usada por PySpark.
+
+[2] Koren, Y., Bell, R., Volinsky, C. (2009).
+    Matrix Factorization Techniques for Recommender Systems.
+    Computer, 42(8), 30-37.
+    DOI: 10.1109/MC.2009.263
+    Enlace: https://doi.org/10.1109/MC.2009.263
+    Uso en el proyecto: base conceptual de factorizacion matricial para
+    recomendacion.
+
+[3] Hu, Y., Koren, Y., Volinsky, C. (2008).
+    Collaborative Filtering for Implicit Feedback Datasets.
+    ICDM 2008.
+    DOI: 10.1109/ICDM.2008.22
+    Enlace: https://doi.org/10.1109/ICDM.2008.22
+    Uso en el proyecto: contexto de feedback implicito y modelos colaborativos.
+
+[4] He, X., Deng, K., Wang, X., Li, Y., Zhang, Y., Wang, M. (2020).
+    LightGCN: Simplifying and Powering Graph Convolution Network for
+    Recommendation.
+    SIGIR 2020.
+    arXiv: https://arxiv.org/abs/2002.02126
+    Codigo oficial: https://github.com/kuandeng/LightGCN
+    Uso en el proyecto: base teorica del pipeline recommender_lightgcn.
+
+[5] Kang, W.-C., McAuley, J. (2018).
+    Self-Attentive Sequential Recommendation.
+    ICDM 2018.
+    arXiv: https://arxiv.org/abs/1808.09781
+    DOI: 10.1109/ICDM.2018.00035
+    Codigo oficial: https://github.com/kang205/SASRec
+    Uso en el proyecto: base teorica del pipeline recommender_sasrec.
+
+[6] RecBole Documentation: LightGCN.
+    Enlace: https://www.recbole.io/docs/v1.2.0/recbole/recbole.model.general_recommender.lightgcn.html
+    Uso en el proyecto: referencia secundaria para parametros y estructura
+    practica de LightGCN.
+
+[7] RecBole Documentation: SASRec.
+    Enlace: https://recbole.io/docs/v1.1.1/user_guide/model/sequential/sasrec.html
+    Uso en el proyecto: referencia secundaria para parametros y estructura
+    practica de SASRec.

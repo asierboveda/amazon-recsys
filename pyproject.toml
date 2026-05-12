@@ -19,6 +19,7 @@ dependencies = [
     "datasets>=4.8.5",
     "hdfs>=2.7.3",
     "pyspark==3.5.3",
+    "torch>=2.0",
 ]
 
 [project.scripts]
