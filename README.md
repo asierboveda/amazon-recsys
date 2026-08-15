@@ -16,8 +16,9 @@ Three families of recommenders share one data-processing pipeline:
 
 - **Data processing** — raw `Video_Games.jsonl` → parquet, cleaning and
   train/test split ([scripts/download_data.py](scripts/download_data.py))
-- **Three recommender pipelines** with a shared evaluation metric,
-  `recall@k` ([src/amazon_recsys/recommender_metrics.py](src/amazon_recsys/recommender_metrics.py))
+- **Three recommender pipelines** evaluated against a **popularity baseline**
+  with a shared metric, `recall@k`, plus RMSE for ALS
+  ([src/amazon_recsys/recommender_metrics.py](src/amazon_recsys/recommender_metrics.py))
 - **Dash dashboard** — data overview, model metrics and per-user
   recommendations ([scripts/run_dashboard.py](scripts/run_dashboard.py))
 - **Notebooks** — [data exploration](notebooks/01_data_exploration.ipynb) and
