@@ -58,4 +58,4 @@ convention).
 
 ## License
 
-MIT (proposed — pending confirmation).
+MIT — see [LICENSE](LICENSE).
