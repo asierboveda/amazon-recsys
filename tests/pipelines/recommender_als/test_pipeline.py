@@ -8,7 +8,7 @@ from pyspark.sql import SparkSession
 
 from amazon_recsys.pipelines.recommender_als.nodes import (
     _compute_recall_at_k,
-    compare_model_metrics,
+    compare_ranking_metrics,
     evaluate_popularity_baseline,
 )
 
@@ -107,38 +107,46 @@ class TestPopularityBaseline:
         als_test = spark.createDataFrame(
             [
                 (0, 10, 4.0, 1000, "u1", "p1"),
-                (0, 20, 3.0, 2000, "u1", "p2"),
+                (0, 20, 4.0, 2000, "u1", "p2"),
             ],
-            schema=["user_idx", "item_idx", "rating", "timestamp", "user_id", "item_id"],
+            schema=[
+                "user_idx",
+                "item_idx",
+                "rating",
+                "timestamp",
+                "user_id",
+                "item_id",
+            ],
         )
-        metrics = evaluate_popularity_baseline(
-            recs, als_test, {"k_values": [1, 2]}
-        )
+        metrics = evaluate_popularity_baseline(recs, als_test, {"k_values": [1, 2]})
         assert metrics["recall@1"] == 0.5
         assert metrics["recall@2"] == 1.0
 
 
 class TestCompareModelMetrics:
-    def test_als_beats_popularity(self):
-        als_reg = {"rmse": 0.8}
-        als_rank = {"recall@10": 0.15, "recall@20": 0.22}
-        pop_rank = {"recall@10": 0.10, "recall@20": 0.18}
-        result = compare_model_metrics(als_reg, als_rank, pop_rank)
+    def test_compares_ranking_metrics_only(self):
+        result = compare_ranking_metrics(
+            {"recall@10": 0.15, "recall@20": 0.22},
+            {"recall@10": 0.10, "recall@20": 0.18},
+        )
         assert result["als_beats_popularity"] is True
+        assert "als_regression" not in result
 
-    def test_als_does_not_beat_popularity(self):
-        als_reg = {"rmse": 1.2}
-        als_rank = {"recall@10": 0.08, "recall@20": 0.12}
-        pop_rank = {"recall@10": 0.10, "recall@20": 0.18}
-        result = compare_model_metrics(als_reg, als_rank, pop_rank)
-        assert result["als_beats_popularity"] is False
 
-    def test_comparison_has_all_keys(self):
-        als_reg = {"rmse": 0.8}
-        als_rank = {"recall@10": 0.15}
-        pop_rank = {"recall@10": 0.10}
-        result = compare_model_metrics(als_reg, als_rank, pop_rank)
-        assert "als_regression" in result
-        assert "als_ranking" in result
-        assert "popularity_ranking" in result
-        assert "als_beats_popularity" in result
+def test_popularity_excludes_validation_and_breaks_ties_by_rating(spark):
+    from amazon_recsys.pipelines.recommender_als.nodes import build_popularity_baseline
+
+    train = spark.createDataFrame(
+        [(1, 10, 4.0), (2, 20, 5.0), (3, 30, 4.0), (4, 40, 5.0)],
+        "user_idx int, item_idx int, rating float",
+    )
+    targets = spark.createDataFrame(
+        [(9, 10, 5.0)], "user_idx int, item_idx int, rating float"
+    )
+    seen = spark.createDataFrame([(9, 20)], "user_idx int, item_idx int")
+    recs = (
+        build_popularity_baseline(train, targets, {"k": 3}, seen)
+        .orderBy("rank")
+        .collect()
+    )
+    assert [row.item_idx for row in recs] == [40, 10, 30]

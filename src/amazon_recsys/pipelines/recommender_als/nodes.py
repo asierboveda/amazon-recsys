@@ -1,13 +1,12 @@
 """Recommender-ALS pipeline nodes.
 
-All nodes use PySpark exclusively. No Pandas, no collect() on large data.
+Nodes use PySpark and collect small experimental datasets on the driver.
 The trained ALS model is persisted to disk via Spark's native save/load
 because Kedro's pickle-based serialisation cannot round-trip ALSModel.
 """
 
 from collections import defaultdict
 
-from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.recommendation import ALS, ALSModel
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -15,10 +14,8 @@ from pyspark.sql import types as T
 from pyspark.sql.window import Window
 
 
-def train_als_explicit_model(
-    train: DataFrame, als_params: dict
-) -> dict:
-    """Train a Spark ALS model for explicit-feedback collaborative filtering.
+def train_als_implicit_model(train: DataFrame, als_params: dict) -> dict:
+    """Train a Spark ALS model for implicit-feedback collaborative filtering.
 
     The trained model is persisted to disk using model.write().overwrite().save()
     and only a lightweight metadata dictionary is returned through the Kedro
@@ -31,13 +28,13 @@ def train_als_explicit_model(
     Returns:
         A dictionary with model metadata and the path where the model was saved.
     """
-    spark = SparkSession.builder.getOrCreate()
-
     rank = als_params.get("rank", 50)
     max_iter = als_params.get("maxIter", 10)
     reg_param = als_params.get("regParam", 0.1)
     nonnegative = als_params.get("nonnegative", True)
-    implicit_prefs = als_params.get("implicitPrefs", False)
+    implicit_prefs = als_params.get("implicitPrefs", True)
+    if not implicit_prefs:
+        raise ValueError("This experiment requires implicit ALS.")
     cold_start_strategy = als_params.get("coldStartStrategy", "drop")
     seed = als_params.get("seed", 42)
     model_path = als_params.get("model_path", "data/06_models/als_model_spark")
@@ -55,7 +52,9 @@ def train_als_explicit_model(
         seed=seed,
     )
 
-    model = als.fit(train)
+    model = als.fit(
+        train.withColumn(als_params.get("rating_col", "rating"), F.lit(1.0))
+    )
 
     model.write().overwrite().save(model_path)
 
@@ -77,28 +76,31 @@ def _load_model(model_info: dict) -> ALSModel:
 
 
 def generate_als_recommendations(
-    model_info: dict, als_train: DataFrame, als_test: DataFrame, recommender_params: dict
+    model_info: dict,
+    als_train: DataFrame,
+    als_test: DataFrame,
+    recommender_params: dict,
+    seen_history: DataFrame | None = None,
 ) -> DataFrame:
     """Generate top-K recommendations for every user present in the test set.
 
-    Processes users in batches to limit driver memory usage.
-    Items already seen in training are excluded from the final output.
+    Scores the full trained catalogue in user batches and excludes the supplied
+    seen history before selecting the final top K.
 
     Args:
-        model_info:          Dictionary returned by train_als_explicit_model.
+        model_info:          Dictionary returned by train_als_implicit_model.
         als_train:           Training interactions used to filter already-seen items.
         als_test:            Test-set interactions (at least user_idx column).
-        recommender_params:  Dict with `k` (int), `num_candidates` (int),
-                             `user_batch_size` (int).
+        recommender_params:  Dict with `k` and `user_batch_size`.
 
     Returns:
         DataFrame with columns [user_idx, item_idx, score, rank].
     """
     spark = SparkSession.builder.getOrCreate()
     k = recommender_params.get("k", 20)
-    num_candidates = int(recommender_params.get("num_candidates", 200))
-    user_batch_size = int(recommender_params.get("user_batch_size", 500))
     model = _load_model(model_info)
+    num_candidates = model.itemFactors.count()
+    user_batch_size = int(recommender_params.get("user_batch_size", 500))
 
     # Collect user list and seen items once (small data)
     all_user_ids: list[int] = [
@@ -107,7 +109,7 @@ def generate_als_recommendations(
     ]
 
     seen_rows = (
-        als_train
+        (seen_history if seen_history is not None else als_train)
         .select(F.col("user_idx").cast("int"), F.col("item_idx").cast("int"))
         .distinct()
         .collect()
@@ -116,12 +118,14 @@ def generate_als_recommendations(
     for row in seen_rows:
         seen_by_user[row.user_idx].add(row.item_idx)
 
-    schema = T.StructType([
-        T.StructField("user_idx", T.IntegerType(), False),
-        T.StructField("item_idx", T.IntegerType(), False),
-        T.StructField("score", T.DoubleType(), False),
-        T.StructField("rank", T.IntegerType(), False),
-    ])
+    schema = T.StructType(
+        [
+            T.StructField("user_idx", T.IntegerType(), False),
+            T.StructField("item_idx", T.IntegerType(), False),
+            T.StructField("score", T.DoubleType(), False),
+            T.StructField("rank", T.IntegerType(), False),
+        ]
+    )
 
     output_rows: list[tuple] = []
     for start in range(0, len(all_user_ids), user_batch_size):
@@ -158,30 +162,6 @@ def generate_als_recommendations(
     return spark.createDataFrame(output_rows, schema=schema)
 
 
-def evaluate_rmse(model_info: dict, als_validation: DataFrame) -> dict:
-    """Compute RMSE of the ALS model on a hold-out validation set.
-
-    Args:
-        model_info:      Dictionary returned by train_als_explicit_model.
-        als_validation:  Validation interactions (user_idx, item_idx, rating).
-
-    Returns:
-        Dictionary ``{"rmse": <float_value>}``.
-    """
-    model = _load_model(model_info)
-
-    predictions = model.transform(als_validation)
-
-    evaluator = RegressionEvaluator(
-        metricName="rmse",
-        labelCol="rating",
-        predictionCol="prediction",
-    )
-    rmse = evaluator.evaluate(predictions)
-
-    return {"rmse": round(rmse, 6)}
-
-
 def _compute_recall_at_k(
     recommendations: DataFrame, ground_truth: DataFrame, k: int
 ) -> float:
@@ -205,9 +185,7 @@ def _compute_recall_at_k(
 
     hits = top_k.join(relevant, ["user_idx", "item_idx"], "inner")
 
-    hit_count = hits.groupBy("user_idx").agg(
-        F.count("item_idx").alias("num_hits")
-    )
+    hit_count = hits.groupBy("user_idx").agg(F.count("item_idx").alias("num_hits"))
 
     user_recall = rel_count.join(hit_count, "user_idx", "left").fillna(0)
     user_recall = user_recall.withColumn(
@@ -235,9 +213,7 @@ def evaluate_ranking_metrics(
         Dictionary mapping "recall@<k>" to the computed value.
     """
     k_values = evaluation_params.get("k_values", [10, 20])
-    threshold = float(evaluation_params.get("positive_threshold", 4.0))
-
-    ground_truth = als_test.filter(F.col("rating") >= threshold)
+    ground_truth = als_test
 
     metrics = {}
     for k in k_values:
@@ -251,6 +227,7 @@ def build_popularity_baseline(
     als_train: DataFrame,
     als_test: DataFrame,
     recommender_params: dict,
+    seen_history: DataFrame | None = None,
 ) -> DataFrame:
     """Build a non-personalised popularity baseline.
 
@@ -273,29 +250,21 @@ def build_popularity_baseline(
         F.avg("rating").alias("avg_rating"),
     )
 
-    window_global = Window.orderBy(
-        F.col("score").desc(), F.col("avg_rating").desc()
-    )
-    popularity = popularity.withColumn(
-        "_glob", F.row_number().over(window_global)
-    )
-
-    num_candidates = max(k * 10, 200)
-    top_popular = popularity.filter(F.col("_glob") <= num_candidates).select(
-        "item_idx", "score"
-    )
-
     test_users = als_test.select("user_idx").distinct()
-    seen_items = als_train.select("user_idx", "item_idx").distinct()
-
-    recs = test_users.crossJoin(top_popular)
+    seen_items = (
+        (seen_history if seen_history is not None else als_train)
+        .select("user_idx", "item_idx")
+        .distinct()
+    )
+    recs = test_users.crossJoin(popularity)
     recs = recs.join(seen_items, ["user_idx", "item_idx"], "left_anti")
-
     window_user = Window.partitionBy("user_idx").orderBy(
-        F.col("score").desc()
+        F.col("score").desc(), F.col("avg_rating").desc(), F.col("item_idx").asc()
     )
     recs = recs.withColumn("rank", F.row_number().over(window_user))
-    recs = recs.filter(F.col("rank") <= k)
+    recs = recs.filter(F.col("rank") <= k).select(
+        "user_idx", "item_idx", "score", "rank"
+    )
 
     return recs
 
@@ -319,39 +288,21 @@ def evaluate_popularity_baseline(
 
     metrics = {}
     for k in k_values:
-        recall = _compute_recall_at_k(
-            popularity_recommendations_top_k, als_test, k
-        )
+        recall = _compute_recall_at_k(popularity_recommendations_top_k, als_test, k)
         metrics[f"recall@{k}"] = round(recall, 6)
 
     return metrics
 
 
-def compare_model_metrics(
-    als_regression_metrics: dict,
-    als_ranking_metrics: dict,
-    popularity_ranking_metrics: dict,
+def compare_ranking_metrics(
+    als_ranking_metrics: dict, popularity_ranking_metrics: dict
 ) -> dict:
-    """Build a comparison report between ALS and the popularity baseline.
-
-    Args:
-        als_regression_metrics:    RMSE dict from evaluate_rmse.
-        als_ranking_metrics:       Recall@K dict from evaluate_ranking_metrics.
-        popularity_ranking_metrics: Recall@K dict from evaluate_popularity_baseline.
-
-    Returns:
-        A comparison dictionary.
-    """
-    als_beats_pop = True
-    for k, val in als_ranking_metrics.items():
-        pop_val = popularity_ranking_metrics.get(k, -1)
-        if val <= pop_val:
-            als_beats_pop = False
-            break
-
+    """Compare ranking metrics computed over the same test population."""
     return {
-        "als_regression": als_regression_metrics,
         "als_ranking": als_ranking_metrics,
         "popularity_ranking": popularity_ranking_metrics,
-        "als_beats_popularity": als_beats_pop,
+        "als_beats_popularity": all(
+            value > popularity_ranking_metrics[key]
+            for key, value in als_ranking_metrics.items()
+        ),
     }

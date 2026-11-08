@@ -84,9 +84,9 @@ als_test:
 # 3. recommender_als outputs
 # ============================================================
 
-als_explicit_model:
+als_implicit_model:
   type: pickle.PickleDataset
-  filepath: data/06_models/als_explicit_model.pkl
+  filepath: data/06_models/als_implicit_model.pkl
 
 als_recommendations_top_k:
   type: spark.SparkDataset
@@ -101,10 +101,6 @@ popularity_recommendations_top_k:
   file_format: parquet
   save_args:
     mode: overwrite
-
-als_regression_metrics:
-  type: json.JSONDataset
-  filepath: data/08_reporting/als_regression_metrics.json
 
 als_ranking_metrics:
   type: json.JSONDataset
@@ -147,3 +143,14 @@ sasrec_recommendations_top_k:
 sasrec_ranking_metrics:
   type: json.JSONDataset
   filepath: data/08_reporting/sasrec_ranking_metrics.json
+
+# Shared experiment outputs, used by the dashboard and notebooks.
+eligible_test:
+  type: spark.SparkDataset
+  filepath: data/05_model_input/eligible_test.parquet
+  file_format: parquet
+  save_args: {mode: overwrite}
+
+experiment_stats:
+  type: json.JSONDataset
+  filepath: data/08_reporting/experiment_stats.json

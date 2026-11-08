@@ -20,6 +20,8 @@ def create_pipeline(**kwargs) -> Pipeline:
                     "als_validation",
                     "als_test",
                     "params:recommender_sasrec.data",
+                    "eligible_validation",
+                    "eligible_test",
                 ],
                 outputs=[
                     "sasrec_train_sequences",
@@ -36,6 +38,7 @@ def create_pipeline(**kwargs) -> Pipeline:
                     "sasrec_train_sequences",
                     "sasrec_validation_sequences",
                     "params:recommender_sasrec.model",
+                    "als_train",
                 ],
                 outputs="sasrec_model",
                 name="train_sasrec_model_node",

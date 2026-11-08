@@ -35,7 +35,7 @@ def ranking_metrics_at_k(
         hits = [item_idx for item_idx in recommended if item_idx in relevant]
 
         recalls.append(len(hits) / len(relevant) if relevant else 0.0)
-        precisions.append(len(hits) / len(recommended) if recommended else 0.0)
+        precisions.append(len(hits) / k if k > 0 else 0.0)
 
         dcg = 0.0
         for rank, item_idx in enumerate(recommended, start=1):
@@ -62,9 +62,7 @@ def catalog_coverage_at_k(
     return round(distinct_items / catalog_size, 6)
 
 
-def average_jaccard_at_k(
-    left: pd.DataFrame, right: pd.DataFrame, k: int
-) -> float:
+def average_jaccard_at_k(left: pd.DataFrame, right: pd.DataFrame, k: int) -> float:
     """Compute average user-level Jaccard overlap between two top-K lists."""
     users = sorted(set(left["user_idx"]).union(set(right["user_idx"])))
     if not users:
@@ -75,9 +73,7 @@ def average_jaccard_at_k(
     values = []
     for user_idx in users:
         left_items = set(left_top.loc[left_top["user_idx"] == user_idx, "item_idx"])
-        right_items = set(
-            right_top.loc[right_top["user_idx"] == user_idx, "item_idx"]
-        )
+        right_items = set(right_top.loc[right_top["user_idx"] == user_idx, "item_idx"])
         union = left_items | right_items
         if not union:
             values.append(0.0)
@@ -93,6 +89,9 @@ def build_metric_table(
     k_values: list[int],
 ) -> pd.DataFrame:
     """Build a long model-metric table for dashboard charts."""
+    columns = ["model", "k", "recall", "precision", "ndcg", "coverage"]
+    if ground_truth.empty:
+        return pd.DataFrame(columns=columns)
     rows = []
     for model_name, recs in recommendations_by_model.items():
         for k in k_values:
@@ -105,4 +104,4 @@ def build_metric_table(
                     "coverage": catalog_coverage_at_k(recs, catalog_size, k),
                 }
             )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=columns)

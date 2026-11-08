@@ -23,7 +23,6 @@ from .metrics import build_metric_table
 def create_app(
     project_path: str | Path | None = None,
     max_test_users: int = 1000,
-    positive_threshold: float = 4.0,
 ) -> Dash:
     """Create the Dash application using materialized Kedro outputs."""
     project_path = Path(project_path or Path.cwd())
@@ -37,13 +36,17 @@ def create_app(
         overview = load_dataset_overview(catalog)
         ground_truth, users = load_ground_truth(
             catalog,
-            positive_threshold=positive_threshold,
             max_users=max_test_users,
         )
-        recommendations = available_recommendation_tables(catalog)
+        recommendations = available_recommendation_tables(catalog, users=users)
+        experiment_stats = (
+            catalog.load("experiment_stats")
+            if catalog.exists("experiment_stats")
+            else {}
+        )
         recommendations = filter_recommendations_to_users(recommendations, users)
 
-    catalog_size = int(overview.get("n_items", 0))
+    catalog_size = int(experiment_stats.get("catalog_size", 0))
     metrics_df = build_metric_table(
         recommendations,
         ground_truth,

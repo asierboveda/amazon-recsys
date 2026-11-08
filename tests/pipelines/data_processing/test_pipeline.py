@@ -4,7 +4,7 @@ import os
 import sys
 
 import pytest
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import SparkSession
 
 from amazon_recsys.pipelines.data_processing.nodes import (
     clean_recommender_interactions,
@@ -48,8 +48,12 @@ def sample_raw(spark):
             ("u4", "p3", 3.0, 3500, True, 0),
         ],
         schema=[
-            "user_id", "parent_asin", "rating", "timestamp",
-            "verified_purchase", "helpful_vote",
+            "user_id",
+            "parent_asin",
+            "rating",
+            "timestamp",
+            "verified_purchase",
+            "helpful_vote",
         ],
     )
 
@@ -64,8 +68,14 @@ class TestSelectRecommenderColumns:
 
     def test_keeps_expected_columns(self, sample_raw):
         result = select_recommender_columns(sample_raw)
-        expected = {"user_id", "item_id", "rating", "timestamp",
-                    "verified_purchase", "helpful_vote"}
+        expected = {
+            "user_id",
+            "item_id",
+            "rating",
+            "timestamp",
+            "verified_purchase",
+            "helpful_vote",
+        }
         assert set(result.columns) == expected
 
     def test_does_not_drop_rows(self, sample_raw):
@@ -82,8 +92,14 @@ class TestCleanRecommenderInteractions:
                 ("u1", None, 4.0, 1000, True, 0),
                 ("u1", "p1", None, 1000, True, 0),
             ],
-            schema=["user_id", "item_id", "rating", "timestamp",
-                    "verified_purchase", "helpful_vote"],
+            schema=[
+                "user_id",
+                "item_id",
+                "rating",
+                "timestamp",
+                "verified_purchase",
+                "helpful_vote",
+            ],
         )
         result = clean_recommender_interactions(df)
         assert result.count() == 1
@@ -95,8 +111,14 @@ class TestCleanRecommenderInteractions:
                 ("u1", "p2", 5.0, 1000, True, 0),
                 ("u1", "p3", 6.0, 1000, True, 0),
             ],
-            schema=["user_id", "item_id", "rating", "timestamp",
-                    "verified_purchase", "helpful_vote"],
+            schema=[
+                "user_id",
+                "item_id",
+                "rating",
+                "timestamp",
+                "verified_purchase",
+                "helpful_vote",
+            ],
         )
         result = clean_recommender_interactions(df)
         assert result.count() == 1
@@ -107,8 +129,14 @@ class TestCleanRecommenderInteractions:
                 ("u1", "p1", 4.0, 1000, True, -5),
                 ("u1", "p2", 5.0, 1000, True, 3),
             ],
-            schema=["user_id", "item_id", "rating", "timestamp",
-                    "verified_purchase", "helpful_vote"],
+            schema=[
+                "user_id",
+                "item_id",
+                "rating",
+                "timestamp",
+                "verified_purchase",
+                "helpful_vote",
+            ],
         )
         result = clean_recommender_interactions(df)
         helpful_votes = [r.helpful_vote for r in result.collect()]
@@ -123,8 +151,14 @@ class TestDeduplicateUserItemInteractions:
                 ("u1", "p1", 5.0, 2000, True, 0),
                 ("u2", "p1", 3.0, 1500, True, 0),
             ],
-            schema=["user_id", "item_id", "rating", "timestamp",
-                    "verified_purchase", "helpful_vote"],
+            schema=[
+                "user_id",
+                "item_id",
+                "rating",
+                "timestamp",
+                "verified_purchase",
+                "helpful_vote",
+            ],
         )
         result = deduplicate_user_item_interactions(df)
         assert result.count() == 2
@@ -198,3 +232,44 @@ class TestTemporalSplit:
         assert val.count() == 1
         assert train.count() == 1
         assert test.count() == 1
+
+
+def test_filter_rechecks_users_after_removing_rare_items(spark):
+    df = spark.createDataFrame(
+        [
+            ("u1", "shared", 5.0, 1),
+            ("u1", "rare1", 5.0, 2),
+            ("u1", "rare2", 5.0, 3),
+            ("u2", "shared", 5.0, 1),
+            ("u2", "shared2", 5.0, 2),
+            ("u2", "shared3", 5.0, 3),
+            ("u3", "shared", 5.0, 1),
+            ("u3", "shared2", 5.0, 2),
+            ("u3", "shared3", 5.0, 3),
+        ],
+        "user_id string, item_id string, rating float, timestamp long",
+    )
+    result = filter_min_activity(df, 3, 2)
+    assert {r.user_id for r in result.select("user_id").distinct().collect()} == {
+        "u2",
+        "u3",
+    }
+
+
+def test_split_drops_short_histories_and_breaks_ties(spark):
+    df = spark.createDataFrame(
+        [
+            ("u1", 1, 1, 5.0, 1),
+            ("u1", 1, 2, 5.0, 1),
+            ("u1", 1, 3, 5.0, 1),
+            ("u2", 2, 4, 5.0, 1),
+            ("u2", 2, 5, 5.0, 2),
+        ],
+        "user_id string, user_idx int, item_idx int, rating float, timestamp long",
+    )
+    train, val, test = temporal_train_validation_test_split(
+        df, {"use_validation": True}
+    )
+    assert [(r.user_id, r.item_idx) for r in test.collect()] == [("u1", 1)]
+    assert [(r.user_id, r.item_idx) for r in val.collect()] == [("u1", 2)]
+    assert [(r.user_id, r.item_idx) for r in train.collect()] == [("u1", 3)]

@@ -1,100 +1,55 @@
 # amazon-recsys
 
-[![Powered by Kedro](https://img.shields.io/badge/powered_by-kedro-ffc900?logo=kedro)](https://kedro.org)
+Proyecto Kedro para procesar reseñas de videojuegos de Amazon Reviews 2023 y comparar recomendaciones de popularidad, ALS, LightGCN y SASRec. Incluye un dashboard Dash y notebooks de exploración y evaluación. La descripción detallada de los datos, pipelines y métricas está en [context.md](context.md).
 
-## Overview
+## Instalación
 
-This is your new Kedro project with PySpark setup, which was generated using `kedro 1.3.1`.
+Se requiere Python 3.10 o superior y Java compatible con PySpark 3.5. Desde la raíz del repositorio, con [uv](https://docs.astral.sh/uv/):
 
-Take a look at the [Kedro documentation](https://docs.kedro.org) to get started.
-
-## Rules and guidelines
-
-In order to get the best out of the template:
-
-* Don't remove any lines from the `.gitignore` file we provide
-* Make sure your results can be reproduced by following a [data engineering convention](https://docs.kedro.org/en/stable/faq/faq.html#what-is-data-engineering-convention)
-* Don't commit data to your repository
-* Don't commit any credentials or your local configuration to your repository. Keep all your credentials and local configuration in `conf/local/`
-
-## How to install dependencies
-
-Declare any dependencies in `requirements.txt` for `pip` installation.
-
-To install them, run:
-
-```
-pip install -r requirements.txt
+```bash
+uv sync --extra dev
 ```
 
-## How to run your Kedro pipeline
+Alternativamente, en un entorno virtual: `pip install -r requirements.txt` instala el proyecto y sus dependencias; `pip install -e '.[dev]'` añade las herramientas de desarrollo. Las dependencias se declaran en `pyproject.toml`; `uv.lock` fija la resolución para uv.
 
-You can run your Kedro project with:
+## Datos y ejecución
 
-```
-kedro run
-```
+La descarga requiere acceso a Hugging Face y espacio suficiente para el dataset completo:
 
-## How to test your Kedro project
-
-Have a look at the files `tests/test_run.py` and `tests/pipelines/data_science/test_pipeline.py` for instructions on how to write your tests. Run the tests as follows:
-
-```
-pytest
+```bash
+uv run python scripts/download_data.py
+uv run kedro run
 ```
 
-You can configure the coverage threshold in your project's `pyproject.toml` file under the `[tool.coverage.report]` section.
+El comando predeterminado ejecuta el procesamiento de datos y ALS con el baseline de popularidad. Para ejecutar todos los modelos, incluyendo LightGCN y SASRec:
 
-## Project dependencies
-
-To see and update the dependency requirements for your project use `requirements.txt`. Install the project requirements with `pip install -r requirements.txt`.
-
-[Further information about project dependencies](https://docs.kedro.org/en/stable/kedro_project_setup/dependencies.html#project-specific-dependencies)
-
-## How to work with Kedro and notebooks
-
-> Note: Using `kedro jupyter` or `kedro ipython` to run your notebook provides these variables in scope: `catalog`, `context`, `pipelines` and `session`.
->
-> Jupyter, JupyterLab, and IPython are already included in the project requirements by default, so once you have run `pip install -r requirements.txt` you will not need to take any extra steps before you use them.
-
-### Jupyter
-To use Jupyter notebooks in your Kedro project, you need to install Jupyter:
-
-```
-pip install jupyter
+```bash
+uv run kedro run --pipeline all_recommenders
 ```
 
-After installing Jupyter, you can start a local notebook server:
+También se pueden ejecutar los pipelines `data_processing`, `recommender_als`, `recommender_lightgcn` y `recommender_sasrec` por separado; los de modelos requieren las salidas de procesamiento. Los artefactos se guardan en las capas de `data/`, que no se versionan.
 
-```
-kedro jupyter notebook
-```
+Para abrir el dashboard, después de generar los datos y recomendaciones disponibles:
 
-### JupyterLab
-To use JupyterLab, you need to install it:
-
-```
-pip install jupyterlab
+```bash
+uv run python scripts/run_dashboard.py
 ```
 
-You can also start JupyterLab:
+Visita http://127.0.0.1:8050. Los notebooks están en `notebooks/`; el dashboard y los notebooks pueden mostrar resultados parciales cuando faltan modelos.
 
-```
-kedro jupyter lab
-```
+## Desarrollo
 
-### IPython
-And if you want to run an IPython session:
-
-```
-kedro ipython
+```bash
+uv run --extra dev pytest
+uv run --extra dev ruff check .
+# Ejecuta los cuatro métodos y el grafo completo con datos sintéticos aislados:
+uv run python scripts/verify_synthetic_experiment.py
 ```
 
-### How to ignore notebook output cells in `git`
-To automatically strip out all output cell contents before committing to `git`, you can use tools like [`nbstripout`](https://github.com/kynan/nbstripout). For example, you can add a hook in `.git/config` with `nbstripout --install`. This will run `nbstripout` before anything is committed to `git`.
+Las pruebas Spark necesitan Java. La configuración local y las credenciales pertenecen a `conf/local/` y no deben incluirse en Git.
 
-> *Note:* Your output cells will be retained locally.
+## Interpretar el experimento
 
-## Package your Kedro project
+Los cuatro métodos usan interacciones positivas (rating ≥ 4) y se evalúan sobre los mismos usuarios y productos conocidos en entrenamiento. Las recomendaciones excluyen todos los productos vistos en entrenamiento y validación. Los modelos neuronales seleccionan el mejor checkpoint mediante Recall@20 en validación; test se reserva para el resultado final. El informe `data/08_reporting/experiment_stats.json` contabiliza los casos elegibles y las exclusiones.
 
-[Further information about building project documentation and packaging your project](https://docs.kedro.org/en/stable/tutorial/package_a_project.html)
+La división es temporal por usuario y retrospectiva, no un corte global. El protocolo, los algoritmos y sus límites se explican en [context.md](context.md). Vuelve a ejecutar los pipelines después de actualizar el código: las recomendaciones y métricas generadas con versiones anteriores no son comparables con las nuevas.

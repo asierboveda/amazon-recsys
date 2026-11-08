@@ -71,3 +71,21 @@ def test_top_recommendations_with_hits_flags_ground_truth_items():
 
     assert result.loc[result["item_idx"] == 10, "hit"].iloc[0] is True
     assert result.loc[result["item_idx"] == 99, "hit"].iloc[0] is False
+
+
+def test_ground_truth_uses_shared_eligible_population():
+    from amazon_recsys.dashboard.data_loader import load_ground_truth
+
+    catalog = DummyCatalog(
+        {
+            "eligible_test": pd.DataFrame(
+                [{"user_idx": 1, "item_idx": 10, "rating": 3.0}]
+            ),
+            "als_test": pd.DataFrame([{"user_idx": 2, "item_idx": 20, "rating": 5.0}]),
+        }
+    )
+    truth, users = load_ground_truth(catalog)
+    assert truth[["user_idx", "item_idx"]].to_dict("records") == [
+        {"user_idx": 1, "item_idx": 10}
+    ]
+    assert users["user_idx"].tolist() == [1]

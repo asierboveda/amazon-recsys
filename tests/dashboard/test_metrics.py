@@ -62,3 +62,21 @@ def test_average_jaccard_at_k_compares_user_recommendation_sets():
     )
 
     assert round(average_jaccard_at_k(left, right, k=2), 6) == 0.666667
+
+
+def test_precision_at_k_uses_k_when_fewer_items_are_available():
+    recommendations = pd.DataFrame([{"user_idx": 1, "item_idx": 10, "rank": 1}])
+    ground_truth = pd.DataFrame([{"user_idx": 1, "item_idx": 10}])
+    assert ranking_metrics_at_k(recommendations, ground_truth, k=5)["precision"] == 0.2
+
+
+def test_metric_table_does_not_report_zero_scores_without_evaluable_users():
+    from amazon_recsys.dashboard.metrics import build_metric_table
+
+    recs = pd.DataFrame([{"user_idx": 1, "item_idx": 10, "rank": 1}])
+    empty_truth = pd.DataFrame(columns=["user_idx", "item_idx"])
+    table = build_metric_table(
+        {"ALS": recs}, empty_truth, catalog_size=10, k_values=[10]
+    )
+    assert table.empty
+    assert "k" in table.columns

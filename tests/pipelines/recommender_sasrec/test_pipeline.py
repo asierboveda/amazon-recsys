@@ -57,19 +57,16 @@ def test_build_sasrec_sequences_orders_history_and_offsets_items(spark):
         {"max_seq_len": 2, "min_sequence_length": 1, "item_id_offset": 1},
     )
 
-    train_rows = {
-        row["user_idx"]: row.asDict()
-        for row in train_seq.collect()
-    }
+    train_rows = {row["user_idx"]: row.asDict() for row in train_seq.collect()}
     validation_row = validation_seq.collect()[0].asDict()
     test_row = test_seq.collect()[0].asDict()
 
-    assert train_rows[0]["sequence"] == [21, 31]
+    assert train_rows[0]["sequence"] == [11, 21, 31]
     assert train_rows[0]["target_item"] == 31
     assert train_rows[1]["sequence"] == [41]
     assert validation_row["sequence"] == [21, 31]
     assert validation_row["target_item"] == 51
-    assert test_row["sequence"] == [31, 51]
+    assert test_row["sequence"] == [21, 31]
     assert test_row["target_item"] == 61
     assert seen_items.where("user_idx = 0").count() == 4
     assert stats["max_seq_len"] == 2
@@ -87,14 +84,30 @@ def test_evaluate_sasrec_ranking_metrics_uses_target_item(spark):
     )
     test_sequences = spark.createDataFrame(
         [
-            (0, [10, 20], 60),
-            (1, [30, 40], 90),
+            (0, [10, 20], 61),
+            (1, [30, 40], 91),
         ],
         schema=["user_idx", "sequence", "target_item"],
     )
 
     metrics = evaluate_sasrec_ranking_metrics(
-        recs, test_sequences, {"k_values": [1, 2], "item_id_offset": 0}
+        recs, test_sequences, {"k_values": [1, 2], "item_id_offset": 1}
     )
 
     assert metrics == {"recall@1": 0.5, "recall@2": 0.5}
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"min_sequence_length": 2},
+        {"test_history_policy": "train"},
+        {"item_id_offset": 2},
+    ],
+)
+def test_rejects_configuration_incompatible_with_shared_protocol(spark, overrides):
+    empty = spark.createDataFrame(
+        [], "user_idx int, item_idx int, rating float, timestamp long"
+    )
+    with pytest.raises(ValueError):
+        build_sasrec_sequences(empty, empty, empty, overrides)

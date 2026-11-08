@@ -1,5 +1,6 @@
 """Project hooks."""
 
+from kedro.config import MissingConfigException
 from kedro.framework.hooks import hook_impl
 
 
@@ -10,7 +11,7 @@ class SparkHook:
     def after_context_created(self, context) -> None:
         try:
             spark_conf: dict = context.config_loader["spark"]
-        except KeyError:
+        except (KeyError, MissingConfigException):
             return
 
         if not spark_conf:

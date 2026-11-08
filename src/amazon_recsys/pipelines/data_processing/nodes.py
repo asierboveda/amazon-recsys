@@ -46,7 +46,7 @@ def clean_recommender_interactions(df: DataFrame) -> DataFrame:
     Returns:
         Cleaned DataFrame with the same schema.
     """
-    df = df.dropna(subset=["user_id", "item_id", "rating"])
+    df = df.dropna(subset=["user_id", "item_id", "rating", "timestamp"])
     df = df.filter((F.col("rating") >= 1) & (F.col("rating") <= 5))
     df = df.withColumn(
         "helpful_vote",
@@ -68,7 +68,10 @@ def deduplicate_user_item_interactions(df: DataFrame) -> DataFrame:
         Deduplicated DataFrame with the same schema.
     """
     window = Window.partitionBy("user_id", "item_id").orderBy(
-        F.col("timestamp").desc()
+        F.col("timestamp").desc(),
+        F.col("rating").desc(),
+        F.col("verified_purchase").desc_nulls_last(),
+        F.col("helpful_vote").desc_nulls_last(),
     )
     df = df.withColumn("_rn", F.row_number().over(window))
     df = df.filter(F.col("_rn") == 1).drop("_rn")
@@ -93,18 +96,25 @@ def filter_min_activity(
         Filtered DataFrame with the same schema.
     """
     user_counts = df.groupBy("user_id").agg(F.count("*").alias("_ucnt"))
-    active_users = user_counts.filter(
-        F.col("_ucnt") >= min_user_interactions
-    ).select("user_id")
+    active_users = user_counts.filter(F.col("_ucnt") >= min_user_interactions).select(
+        "user_id"
+    )
     df = df.join(active_users, "user_id", "inner")
 
     item_counts = df.groupBy("item_id").agg(F.count("*").alias("_icnt"))
-    active_items = item_counts.filter(
-        F.col("_icnt") >= min_item_interactions
-    ).select("item_id")
+    active_items = item_counts.filter(F.col("_icnt") >= min_item_interactions).select(
+        "item_id"
+    )
     df = df.join(active_items, "item_id", "inner")
 
-    return df
+    # Item filtering can leave previously active users with too little history.
+    remaining_users = (
+        df.groupBy("user_id")
+        .count()
+        .filter(F.col("count") >= min_user_interactions)
+        .select("user_id")
+    )
+    return df.join(remaining_users, "user_id", "inner")
 
 
 def index_user_item_ids(
@@ -141,9 +151,7 @@ def index_user_item_ids(
     df = df.withColumn("user_idx", F.col("user_idx").cast("int"))
     df = df.withColumn("item_idx", F.col("item_idx").cast("int"))
 
-    df = df.select(
-        "user_idx", "item_idx", "rating", "timestamp", "user_id", "item_id"
-    )
+    df = df.select("user_idx", "item_idx", "rating", "timestamp", "user_id", "item_id")
 
     user_labels = user_model.labels
     user_mapping = spark.createDataFrame(
@@ -183,9 +191,17 @@ def temporal_train_validation_test_split(
     """
     use_validation = split_params.get("use_validation", True)
     timestamp_col = split_params.get("timestamp_col", "timestamp")
+    minimum = 3 if use_validation else 2
+    eligible_users = (
+        df.groupBy("user_id")
+        .count()
+        .filter(F.col("count") >= minimum)
+        .select("user_id")
+    )
+    df = df.join(eligible_users, "user_id", "inner")
 
     window = Window.partitionBy("user_id").orderBy(
-        F.col(timestamp_col).desc()
+        F.col(timestamp_col).desc(), F.col("item_idx").asc()
     )
     df = df.withColumn("_rank", F.row_number().over(window))
 

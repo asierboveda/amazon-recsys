@@ -59,7 +59,8 @@ def model_availability(
 def available_recommendation_tables(
     catalog: Any,
     mapping: dict[str, str] | None = None,
-    max_rows_per_model: int = 100_000,
+    max_rows_per_model: int | None = None,
+    users: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Load existing recommendation datasets as small Pandas tables."""
     mapping = mapping or MODEL_RECOMMENDATION_DATASETS
@@ -68,6 +69,14 @@ def available_recommendation_tables(
         data = _safe_load(catalog, dataset_name)
         if data is None:
             continue
+        if users is not None:
+            user_ids = users["user_idx"].tolist()
+            if isinstance(data, pd.DataFrame):
+                data = data[data["user_idx"].isin(user_ids)]
+            else:
+                from pyspark.sql import functions as F
+
+                data = data.filter(F.col("user_idx").isin(user_ids))
         pdf = _to_pandas(data, max_rows_per_model)
         expected = {"user_idx", "item_idx", "score", "rank"}
         if expected.issubset(pdf.columns):
@@ -77,33 +86,28 @@ def available_recommendation_tables(
 
 def load_ground_truth(
     catalog: Any,
-    positive_threshold: float = 4.0,
     max_users: int = 1000,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load a sampled test ground truth and corresponding user table."""
-    test = _safe_load(catalog, "als_test")
+    """Load the sampled, prefiltered experiment ground truth and users."""
+    test = _safe_load(catalog, "eligible_test")
     if test is None:
         return pd.DataFrame(columns=["user_idx", "item_idx"]), pd.DataFrame(
             columns=["user_idx"]
         )
 
-    if hasattr(test, "filter"):
+    if not isinstance(test, pd.DataFrame) and hasattr(test, "filter"):
         from pyspark.sql import functions as F
 
-        relevant = (
-            test.filter(F.col("rating") >= positive_threshold)
-            .select(F.col("user_idx").cast("int"), F.col("item_idx").cast("int"))
-            .dropDuplicates(["user_idx", "item_idx"])
-        )
+        relevant = test.select(
+            F.col("user_idx").cast("int"), F.col("item_idx").cast("int")
+        ).dropDuplicates(["user_idx", "item_idx"])
         users = relevant.select("user_idx").distinct().orderBy(F.rand(seed))
         users = users.limit(max_users)
         relevant = relevant.join(users, "user_idx", "inner")
         return relevant.toPandas(), users.toPandas()
 
     pdf = _to_pandas(test)
-    if "rating" in pdf.columns:
-        pdf = pdf[pdf["rating"] >= positive_threshold]
     pdf = pdf[["user_idx", "item_idx"]].drop_duplicates()
     users = (
         pdf[["user_idx"]]
@@ -154,7 +158,9 @@ def load_dataset_overview(catalog: Any) -> dict[str, Any]:
         n_items = pdf["item_idx"].nunique() if "item_idx" in pdf else 0
         n_interactions = len(pdf)
         ratings = (
-            pdf.groupby("rating", as_index=False).size().rename(columns={"size": "count"})
+            pdf.groupby("rating", as_index=False)
+            .size()
+            .rename(columns={"size": "count"})
             if "rating" in pdf
             else pd.DataFrame(columns=["rating", "count"])
         )
@@ -168,7 +174,9 @@ def load_dataset_overview(catalog: Any) -> dict[str, Any]:
             else pd.DataFrame(columns=["item_idx", "interactions"])
         )
 
-    sparsity = 1.0 - (n_interactions / (n_users * n_items)) if n_users and n_items else 0.0
+    sparsity = (
+        1.0 - (n_interactions / (n_users * n_items)) if n_users and n_items else 0.0
+    )
     return {
         "n_users": int(n_users),
         "n_items": int(n_items),
@@ -185,7 +193,10 @@ def filter_recommendations_to_users(
 ) -> dict[str, pd.DataFrame]:
     """Filter model recommendations to a sampled user set."""
     if users.empty:
-        return recommendations_by_model
+        return {
+            model: recs.iloc[0:0].copy()
+            for model, recs in recommendations_by_model.items()
+        }
     user_ids = set(users["user_idx"])
     return {
         model: recs[recs["user_idx"].isin(user_ids)].copy()
@@ -204,10 +215,7 @@ def top_recommendations_with_hits(
     rows = []
     for model_name, recs in recommendations_by_model.items():
         user_recs = (
-            recs[recs["user_idx"] == user_idx]
-            .sort_values("rank")
-            .head(k)
-            .copy()
+            recs[recs["user_idx"] == user_idx].sort_values("rank").head(k).copy()
         )
         for row in user_recs.to_dict("records"):
             rows.append(

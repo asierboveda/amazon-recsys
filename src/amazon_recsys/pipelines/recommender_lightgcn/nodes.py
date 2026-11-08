@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import random
 from pathlib import Path
 
@@ -75,23 +76,11 @@ def _collect_pairs(df: DataFrame) -> list[tuple[int, int]]:
     ]
 
 
-def _sample_negative(
-    num_items: int, positives_by_user: dict[int, set[int]], user_idx: int
-) -> int:
-    if len(positives_by_user[user_idx]) >= num_items:
-        raise ValueError(
-            f"User {user_idx} has interacted with every item; cannot sample negative."
-        )
-    while True:
-        item_idx = random.randrange(num_items)
-        if item_idx not in positives_by_user[user_idx]:
-            return item_idx
-
-
 def train_lightgcn_model(
     lightgcn_train_interactions: DataFrame,
     lightgcn_validation_interactions: DataFrame,
     model_params: dict,
+    seen_train: DataFrame | None = None,
 ) -> dict:
     """Train a LightGCN model and persist the PyTorch checkpoint."""
     torch = require_torch()
@@ -125,6 +114,16 @@ def train_lightgcn_model(
     for user_idx, item_idx in train_pairs:
         positives_by_user.setdefault(user_idx, set()).add(item_idx)
 
+    candidate_items = sorted({item for _, item in train_pairs})
+    validation_pairs = _collect_pairs(lightgcn_validation_interactions)
+    if not validation_pairs:
+        raise ValueError("No eligible validation interactions for LightGCN.")
+    seen_by_user: dict[int, set[int]] = {}
+    for user, item in _collect_pairs(
+        seen_train if seen_train is not None else lightgcn_train_interactions
+    ):
+        seen_by_user.setdefault(user, set()).add(item)
+
     optimizer = torch.optim.Adam(
         model.parameters(), lr=float(model_params.get("learning_rate", 0.001))
     )
@@ -134,11 +133,12 @@ def train_lightgcn_model(
     patience = int(model_params.get("patience", 15))
     min_delta = float(model_params.get("min_delta", 1e-4))
 
-    best_loss = float("inf")
+    best_recall = -1.0
+    best_state = None
+    best_epoch = 0
     epochs_no_improve = 0
     last_loss = 0.0
     for epoch in range(epochs):
-        user_final, item_final = model.propagate(normalized_adj)
         random.shuffle(train_pairs)
         batch_starts = list(range(0, len(train_pairs), batch_size))
         epoch_loss = 0.0
@@ -147,47 +147,74 @@ def train_lightgcn_model(
             batch = train_pairs[start : start + batch_size]
             users = [user_idx for user_idx, _ in batch]
             positives = [item_idx for _, item_idx in batch]
-            negatives = [
-                _sample_negative(num_items, positives_by_user, user_idx)
-                for user_idx in users
-            ]
+            negatives = []
+            for user_idx in users:
+                available = [
+                    item
+                    for item in candidate_items
+                    if item not in positives_by_user[user_idx]
+                ]
+                if not available:
+                    raise ValueError(f"User {user_idx} has no negative training item.")
+                negatives.append(random.choice(available))
 
             user_tensor = torch.tensor(users, dtype=torch.long).to(device)
             pos_tensor = torch.tensor(positives, dtype=torch.long).to(device)
             neg_tensor = torch.tensor(negatives, dtype=torch.long).to(device)
 
+            user_final, item_final = model.propagate(normalized_adj)
             loss = bpr_loss(
                 user_final[user_tensor],
                 item_final[pos_tensor],
                 item_final[neg_tensor],
                 reg_weight,
+                (
+                    model.user_embedding(user_tensor),
+                    model.item_embedding(pos_tensor),
+                    model.item_embedding(neg_tensor),
+                ),
             )
 
             optimizer.zero_grad()
-            is_last_batch = batch_num == len(batch_starts) - 1
-            loss.backward(retain_graph=not is_last_batch)
+            loss.backward()
             optimizer.step()
             epoch_loss += float(loss.detach().cpu())
 
-        avg_loss = epoch_loss / max(len(batch_starts), 1)
-        if avg_loss < best_loss - min_delta:
-            best_loss = avg_loss
+        last_loss = epoch_loss / max(len(batch_starts), 1)
+        with torch.no_grad():
+            user_final, item_final = model.propagate(normalized_adj)
+            hits = 0
+            for user, target in validation_pairs:
+                scores = user_final[user] @ item_final.T
+                candidates = [
+                    item
+                    for item in candidate_items
+                    if item not in seen_by_user.get(user, set())
+                ]
+                ranked = sorted(
+                    candidates, key=lambda item: (-float(scores[item]), item)
+                )[:20]
+                hits += target in ranked
+            recall = hits / len(validation_pairs)
+        improved_enough = recall > best_recall + min_delta
+        if recall > best_recall:
+            best_recall = recall
+            best_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch + 1
+        if improved_enough:
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
-
-        print(
-            f"Epoch {epoch + 1}/{epochs} | loss: {avg_loss:.4f} | "
-            f"best: {best_loss:.4f} | patience: {epochs_no_improve}/{patience}"
-        )
-
         if epochs_no_improve >= patience:
-            print(f"Early stopping at epoch {epoch + 1}.")
             break
 
-        last_loss = avg_loss
+    if best_state is None:
+        raise ValueError("LightGCN did not complete a training epoch.")
+    model.load_state_dict(best_state)
 
-    model_path = Path(model_params.get("model_path", "data/06_models/lightgcn_model.pt"))
+    model_path = Path(
+        model_params.get("model_path", "data/06_models/lightgcn_model.pt")
+    )
     model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -208,6 +235,8 @@ def train_lightgcn_model(
         "epochs": epochs,
         "batch_size": batch_size,
         "last_loss": round(last_loss, 6),
+        "best_validation_recall_at_20": best_recall,
+        "best_epoch": best_epoch,
         "num_validation_interactions": lightgcn_validation_interactions.count(),
     }
 
@@ -234,6 +263,7 @@ def generate_lightgcn_recommendations(
     lightgcn_train_interactions: DataFrame,
     als_test: DataFrame,
     recommender_params: dict,
+    seen_history: DataFrame | None = None,
 ) -> DataFrame:
     """Generate LightGCN top-K recommendations for users present in test."""
     torch = require_torch()
@@ -243,7 +273,9 @@ def generate_lightgcn_recommendations(
     k = int(recommender_params.get("k", 20))
     score_batch_size = int(recommender_params.get("score_batch_size", 256))
     seen_by_user: dict[int, set[int]] = {}
-    for user_idx, item_idx in _collect_pairs(lightgcn_train_interactions):
+    for user_idx, item_idx in _collect_pairs(
+        seen_history if seen_history is not None else lightgcn_train_interactions
+    ):
         seen_by_user.setdefault(user_idx, set()).add(item_idx)
 
     test_users = [
@@ -252,6 +284,7 @@ def generate_lightgcn_recommendations(
         if int(row["user_idx"]) < config.num_users
     ]
 
+    candidate_items = {item for _, item in _collect_pairs(lightgcn_train_interactions)}
     with torch.no_grad():
         user_final, item_final = model.propagate(normalized_adj)
 
@@ -260,17 +293,26 @@ def generate_lightgcn_recommendations(
         batch_users = test_users[start : start + score_batch_size]
         user_tensor = torch.tensor(batch_users, dtype=torch.long)
         scores = user_final[user_tensor] @ item_final.T
+        unknown = list(set(range(config.num_items)) - candidate_items)
+        if unknown:
+            scores[:, unknown] = -float("inf")
 
         for row_idx, user_idx in enumerate(batch_users):
             for seen_item in seen_by_user.get(user_idx, set()):
                 if seen_item < config.num_items:
                     scores[row_idx, seen_item] = -float("inf")
-            limit = min(k, config.num_items)
-            values, indices = torch.topk(scores[row_idx], k=limit)
-            for rank, (score, item_idx) in enumerate(zip(values, indices), start=1):
-                if torch.isinf(score):
-                    continue
-                output_rows.append((user_idx, int(item_idx), float(score), rank))
+            candidates = [
+                item
+                for item in candidate_items
+                if item not in seen_by_user.get(user_idx, set())
+            ]
+            ranked = sorted(
+                candidates, key=lambda item: (-float(scores[row_idx, item]), item)
+            )[:k]
+            for rank, item_idx in enumerate(ranked, start=1):
+                output_rows.append(
+                    (user_idx, item_idx, float(scores[row_idx, item_idx]), rank)
+                )
 
     schema = T.StructType(
         [

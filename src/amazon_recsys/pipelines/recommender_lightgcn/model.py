@@ -62,12 +62,8 @@ class LightGCN:
     def __init__(self, config: LightGCNConfig):
         torch = require_torch()
         self.config = config
-        self.user_embedding = torch.nn.Embedding(
-            config.num_users, config.embedding_dim
-        )
-        self.item_embedding = torch.nn.Embedding(
-            config.num_items, config.embedding_dim
-        )
+        self.user_embedding = torch.nn.Embedding(config.num_users, config.embedding_dim)
+        self.item_embedding = torch.nn.Embedding(config.num_items, config.embedding_dim)
         torch.nn.init.normal_(self.user_embedding.weight, std=0.01)
         torch.nn.init.normal_(self.item_embedding.weight, std=0.01)
 
@@ -115,15 +111,12 @@ class LightGCN:
         return user_final, item_final
 
 
-def bpr_loss(user_emb, pos_emb, neg_emb, reg_weight: float):
+def bpr_loss(user_emb, pos_emb, neg_emb, reg_weight: float, initial_embeddings=None):
     """Compute Bayesian Personalized Ranking loss."""
     torch = require_torch()
     pos_scores = (user_emb * pos_emb).sum(dim=1)
     neg_scores = (user_emb * neg_emb).sum(dim=1)
     mf_loss = -torch.nn.functional.logsigmoid(pos_scores - neg_scores).mean()
-    reg_loss = (
-        user_emb.norm(2).pow(2)
-        + pos_emb.norm(2).pow(2)
-        + neg_emb.norm(2).pow(2)
-    ) / (2.0 * len(user_emb))
+    regularized = initial_embeddings or (user_emb, pos_emb, neg_emb)
+    reg_loss = sum(e.norm(2).pow(2) for e in regularized) / (2.0 * len(user_emb))
     return mf_loss + reg_weight * reg_loss
